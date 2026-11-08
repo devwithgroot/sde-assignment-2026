@@ -22,7 +22,7 @@ from controller.services.change_builder import (
     build_rollback_proposal,
     build_winner_proposal,
 )
-from controller.services.experiments import ExperimentState
+from controller.services.experiments import STICKY_PROMOTION_STATUSES, ExperimentState
 from controller.services.incidents import (
     find_open_incidents_for_workflow,
     mark_incident_mitigating,
@@ -612,6 +612,10 @@ def propose_experiment_exploration(
             continue
         if exp.decision == "winner":
             continue
+        # A promoted or decaying experiment is not an exploration candidate.
+        # Replanning must not replace that status with exploration_submitted.
+        if exp.promotion_status in STICKY_PROMOTION_STATUSES:
+            continue
         # Skip if an explore/winner proposal is already open for this experiment.
         open_props = [
             p
@@ -713,6 +717,15 @@ def propose_decay_rollbacks(
     for hit in decay_hits:
         workflow = by_wf.get(hit["workflow_id"])
         if workflow is None:
+            continue
+        already = [
+            p
+            for p in store.recent_proposals_for_workflow(hit["workflow_id"], limit=50)
+            if p["source"] == "decay_rollback"
+            and p["source_ref"] == hit.get("experiment_id")
+            and p["status"] in {"draft", "submitted", "approved", "applied", "auto_applied"}
+        ]
+        if already:
             continue
         try:
             live = client.workflow_config(hit["workflow_id"])

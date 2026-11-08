@@ -29,6 +29,23 @@ CONTROL_FLOOR = 0.30
 EXPLORATION_FLOOR = 0.10
 ACTIVE_STATUSES = frozenset({"planned", "running"})
 TERMINAL_STATUSES = frozenset({"winner", "inconclusive", "guardrail_violation", "stopped"})
+# Statuses written by promotion, governance, or decay. A later stats refresh must not clear them.
+STICKY_PROMOTION_STATUSES = frozenset(
+    {
+        "promoted",
+        "promoted_auto_apply",
+        "proposal_submitted",
+        "decay_detected",
+        "exploration_submitted",
+    }
+)
+# Statuses that planning/evaluation may assign. They must not replace a sticky status.
+PLANNING_PROMOTION_STATUSES = frozenset(
+    {
+        "observe_only_not_promoted",
+        "ready_to_propose_observe_only",
+    }
+)
 
 
 @dataclass
@@ -374,6 +391,7 @@ def plan_experiment(
     guardrail_kpi, guardrail_drop = parse_guardrail(workflow.objective.guardrail)
     now = _now()
     created = existing["created_at"] if existing is not None else now
+    existing_promotion = existing["promotion_status"] if existing is not None else None
     state = ExperimentState(
         experiment_id=eid,
         workflow_id=workflow.workflow_id,
@@ -391,7 +409,7 @@ def plan_experiment(
         min_effect=min_effect,
         created_at=created,
         updated_at=now,
-        promotion_status="observe_only_not_promoted",
+        promotion_status=existing_promotion or "observe_only_not_promoted",
         evidence={
             "allowed_options": allowed,
             "current_allocation": current,
@@ -548,8 +566,10 @@ def evaluate_experiment(state: ExperimentState) -> ExperimentState:
             f"{winner_arm.variant} beats control {state.control_variant} on {state.primary_kpi}: "
             f"{winner_arm.reason}"
         )
-        # Phase 5 does not promote or submit approvals; Phase 6 owns that path.
-        state.promotion_status = "ready_to_propose_observe_only"
+        # Do not downgrade a promotion, in-flight proposal, or decay mark just because
+        # this cycle still sees a statistical winner. Rejected/expired can be re-queued.
+        if state.promotion_status not in STICKY_PROMOTION_STATUSES:
+            state.promotion_status = "ready_to_propose_observe_only"
         state.evidence = {
             **state.evidence,
             "insufficient_data": False,
@@ -602,6 +622,12 @@ def evaluate_experiment(state: ExperimentState) -> ExperimentState:
 
 
 def persist_experiment(store: Store, state: ExperimentState) -> ExperimentState:
+    """Save an experiment. A planning status must not erase a sticky promotion status."""
+    existing = store.get_experiment(state.experiment_id)
+    if existing is not None:
+        current = existing["promotion_status"]
+        if current in STICKY_PROMOTION_STATUSES and state.promotion_status in PLANNING_PROMOTION_STATUSES:
+            state.promotion_status = current
     state.updated_at = _now()
     with store.transaction():
         store.upsert_experiment(state)

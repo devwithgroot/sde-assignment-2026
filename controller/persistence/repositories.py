@@ -586,7 +586,17 @@ class Store:
                  decision = excluded.decision,
                  decision_reason = excluded.decision_reason,
                  winner_variant = excluded.winner_variant,
-                 promotion_status = excluded.promotion_status,
+                 promotion_status = CASE
+                   WHEN experiments.promotion_status IN (
+                          'promoted', 'promoted_auto_apply', 'proposal_submitted',
+                          'decay_detected', 'exploration_submitted'
+                        )
+                    AND excluded.promotion_status IN (
+                          'observe_only_not_promoted', 'ready_to_propose_observe_only'
+                        )
+                   THEN experiments.promotion_status
+                   ELSE excluded.promotion_status
+                 END,
                  evidence_json = excluded.evidence_json""",
             (
                 experiment.experiment_id,
