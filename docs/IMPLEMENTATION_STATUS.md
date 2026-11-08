@@ -1,8 +1,14 @@
 # Implementation status
 
-Phase 0 is done. Phase 1 is done: an observe-only controller reads the live simulator and exits. It does not advance time. Phase 2 has not started.
+Phases 0–5 are done. Phase 5 adds observational welcome/voice experiments, deterministic statistical winner selection, and dashboard experiment panels. Phase 6 (governance apply / promotion) has not started.
 
-Checked on 8 Nov 2026 with `.venv` Python 3.11.9. Simulator: `public_02_incidents`, `http://127.0.0.1:8700`, run directory `runs/phase0_02` (gitignored, disposable). World generation reported ready in 3.8 seconds. `python -m pytest -q tests` from `.venv`: 6 passed in 3.82s. Those tests belong to the simulator, not to a controller.
+Per-phase details:
+
+- `docs/IMPLEMENTATION_STATUS_PHASE1.md` … `PHASE4.md`
+- `docs/IMPLEMENTATION_STATUS_PHASE5.md` — experiments + stats + dashboard
+- `docs/DASHBOARD.md` — read-only monitor
+
+Checked on 8 Nov 2026 with `.venv` Python 3.11.9. Full suite: `68 passed, 1 skipped`.
 
 ## Repository inventory
 
@@ -115,3 +121,9 @@ The Phase 3 record is `docs/IMPLEMENTATION_STATUS_PHASE3.md`.
 ## Phase 4
 
 The Phase 4 record is `docs/IMPLEMENTATION_STATUS_PHASE4.md`. Phase 5 has not started.
+
+## Monitoring dashboard
+
+Read-only UI over controller SQLite. Docs: `docs/DASHBOARD.md`.
+Start: `python -m dashboard --db data/phase3_verify.sqlite --sim-url http://127.0.0.1:8700`
+It does not implement Phase 5 and does not change the controller decision loop.

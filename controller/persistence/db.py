@@ -213,9 +213,61 @@ CREATE INDEX IF NOT EXISTS idx_metric_snapshots_workflow ON metric_snapshots(wor
 CREATE INDEX IF NOT EXISTS idx_detection_signals_workflow ON detection_signals(workflow_id, signal_type);
 CREATE INDEX IF NOT EXISTS idx_calls_ts ON calls(ts);
 CREATE INDEX IF NOT EXISTS idx_calls_caller ON calls(caller_id);
+
+CREATE TABLE IF NOT EXISTS experiments (
+    experiment_id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL,
+    tenant_id TEXT,
+    cohort_id TEXT NOT NULL,
+    dimension TEXT NOT NULL,
+    primary_kpi TEXT NOT NULL,
+    guardrail_kpi TEXT NOT NULL,
+    guardrail_max_drop REAL NOT NULL,
+    status TEXT NOT NULL,
+    control_variant TEXT NOT NULL,
+    planned_allocation_json TEXT NOT NULL,
+    min_sample_per_arm INTEGER NOT NULL,
+    alpha REAL NOT NULL,
+    min_effect REAL NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    decision TEXT,
+    decision_reason TEXT,
+    winner_variant TEXT,
+    promotion_status TEXT,
+    evidence_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS experiment_arms (
+    experiment_id TEXT NOT NULL,
+    variant TEXT NOT NULL,
+    is_control INTEGER NOT NULL DEFAULT 0,
+    planned_weight REAL NOT NULL,
+    dials INTEGER NOT NULL DEFAULT 0,
+    connected INTEGER NOT NULL DEFAULT 0,
+    engaged INTEGER NOT NULL DEFAULT 0,
+    primary_rate REAL,
+    guardrail_rate REAL,
+    sample_n INTEGER NOT NULL DEFAULT 0,
+    sample_ok INTEGER NOT NULL DEFAULT 0,
+    verdict TEXT,
+    effect_size REAL,
+    p_value REAL,
+    adjusted_alpha REAL,
+    ci_low REAL,
+    ci_high REAL,
+    reason TEXT,
+    PRIMARY KEY (experiment_id, variant),
+    FOREIGN KEY (experiment_id) REFERENCES experiments(experiment_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_experiments_workflow ON experiments(workflow_id, status);
+CREATE INDEX IF NOT EXISTS idx_experiment_arms_exp ON experiment_arms(experiment_id);
+CREATE INDEX IF NOT EXISTS idx_calls_voice ON calls(voice);
+CREATE INDEX IF NOT EXISTS idx_calls_welcome ON calls(welcome_message);
 """
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def connect(path: Path) -> sqlite3.Connection:

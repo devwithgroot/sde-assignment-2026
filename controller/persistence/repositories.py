@@ -493,6 +493,195 @@ class Store:
             ).fetchall()
         )
 
+    def variant_call_totals(
+        self,
+        workflow_id: str,
+        dimension: str,
+        variant: str,
+        *,
+        cohort_id: str | None = None,
+    ) -> tuple[int, int, int]:
+        """Return (dials, connected, engaged) for one call-variant cell."""
+        if dimension not in {"welcome_message", "voice", "caller_id"}:
+            raise ValueError(f"unsupported dimension: {dimension}")
+        clauses = ["workflow_id = ?", f"{dimension} = ?"]
+        params: list = [workflow_id, variant]
+        if cohort_id is not None:
+            clauses.append("cohort_id = ?")
+            params.append(cohort_id)
+        where = " AND ".join(clauses)
+        row = self.conn.execute(
+            f"""SELECT
+                    COUNT(*) AS dials,
+                    COALESCE(SUM(connected), 0) AS connected,
+                    COALESCE(SUM(engaged), 0) AS engaged
+                FROM calls WHERE {where}""",
+            params,
+        ).fetchone()
+        return int(row["dials"]), int(row["connected"]), int(row["engaged"])
+
+    def observed_variants(
+        self,
+        workflow_id: str,
+        dimension: str,
+        *,
+        cohort_id: str | None = None,
+    ) -> list[tuple[str, int, int, int]]:
+        """Variants seen in calls with (variant, dials, connected, engaged), dials desc."""
+        if dimension not in {"welcome_message", "voice", "caller_id"}:
+            raise ValueError(f"unsupported dimension: {dimension}")
+        clauses = [f"workflow_id = ?", f"{dimension} IS NOT NULL"]
+        params: list = [workflow_id]
+        if cohort_id is not None:
+            clauses.append("cohort_id = ?")
+            params.append(cohort_id)
+        where = " AND ".join(clauses)
+        rows = self.conn.execute(
+            f"""SELECT {dimension} AS variant,
+                       COUNT(*) AS dials,
+                       COALESCE(SUM(connected), 0) AS connected,
+                       COALESCE(SUM(engaged), 0) AS engaged
+                FROM calls WHERE {where}
+                GROUP BY {dimension}
+                ORDER BY dials DESC, variant ASC""",
+            params,
+        ).fetchall()
+        return [(row["variant"], int(row["dials"]), int(row["connected"]), int(row["engaged"])) for row in rows]
+
+    def upsert_experiment(self, experiment) -> None:
+        self.conn.execute(
+            """INSERT INTO experiments (
+                   experiment_id, workflow_id, tenant_id, cohort_id, dimension,
+                   primary_kpi, guardrail_kpi, guardrail_max_drop, status, control_variant,
+                   planned_allocation_json, min_sample_per_arm, alpha, min_effect,
+                   created_at, updated_at, decision, decision_reason, winner_variant,
+                   promotion_status, evidence_json
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(experiment_id) DO UPDATE SET
+                 tenant_id = excluded.tenant_id,
+                 primary_kpi = excluded.primary_kpi,
+                 guardrail_kpi = excluded.guardrail_kpi,
+                 guardrail_max_drop = excluded.guardrail_max_drop,
+                 status = excluded.status,
+                 control_variant = excluded.control_variant,
+                 planned_allocation_json = excluded.planned_allocation_json,
+                 min_sample_per_arm = excluded.min_sample_per_arm,
+                 alpha = excluded.alpha,
+                 min_effect = excluded.min_effect,
+                 updated_at = excluded.updated_at,
+                 decision = excluded.decision,
+                 decision_reason = excluded.decision_reason,
+                 winner_variant = excluded.winner_variant,
+                 promotion_status = excluded.promotion_status,
+                 evidence_json = excluded.evidence_json""",
+            (
+                experiment.experiment_id,
+                experiment.workflow_id,
+                experiment.tenant_id,
+                experiment.cohort_id,
+                experiment.dimension,
+                experiment.primary_kpi,
+                experiment.guardrail_kpi,
+                experiment.guardrail_max_drop,
+                experiment.status,
+                experiment.control_variant,
+                json.dumps(experiment.planned_allocation, sort_keys=True),
+                experiment.min_sample_per_arm,
+                experiment.alpha,
+                experiment.min_effect,
+                experiment.created_at,
+                experiment.updated_at,
+                experiment.decision,
+                experiment.decision_reason,
+                experiment.winner_variant,
+                experiment.promotion_status,
+                json.dumps(experiment.evidence, sort_keys=True),
+            ),
+        )
+
+    def upsert_experiment_arm(self, arm) -> None:
+        self.conn.execute(
+            """INSERT INTO experiment_arms (
+                   experiment_id, variant, is_control, planned_weight,
+                   dials, connected, engaged, primary_rate, guardrail_rate,
+                   sample_n, sample_ok, verdict, effect_size, p_value,
+                   adjusted_alpha, ci_low, ci_high, reason
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(experiment_id, variant) DO UPDATE SET
+                 is_control = excluded.is_control,
+                 planned_weight = excluded.planned_weight,
+                 dials = excluded.dials,
+                 connected = excluded.connected,
+                 engaged = excluded.engaged,
+                 primary_rate = excluded.primary_rate,
+                 guardrail_rate = excluded.guardrail_rate,
+                 sample_n = excluded.sample_n,
+                 sample_ok = excluded.sample_ok,
+                 verdict = excluded.verdict,
+                 effect_size = excluded.effect_size,
+                 p_value = excluded.p_value,
+                 adjusted_alpha = excluded.adjusted_alpha,
+                 ci_low = excluded.ci_low,
+                 ci_high = excluded.ci_high,
+                 reason = excluded.reason""",
+            (
+                arm.experiment_id,
+                arm.variant,
+                1 if arm.is_control else 0,
+                arm.planned_weight,
+                arm.dials,
+                arm.connected,
+                arm.engaged,
+                arm.primary_rate,
+                arm.guardrail_rate,
+                arm.sample_n,
+                1 if arm.sample_ok else 0,
+                arm.verdict,
+                arm.effect_size,
+                arm.p_value,
+                arm.adjusted_alpha,
+                arm.ci_low,
+                arm.ci_high,
+                arm.reason,
+            ),
+        )
+
+    def list_experiments(self, workflow_id: str | None = None) -> list[sqlite3.Row]:
+        if workflow_id is None:
+            return list(self.conn.execute("SELECT * FROM experiments ORDER BY experiment_id").fetchall())
+        return list(
+            self.conn.execute(
+                "SELECT * FROM experiments WHERE workflow_id = ? ORDER BY experiment_id",
+                (workflow_id,),
+            ).fetchall()
+        )
+
+    def get_experiment(self, experiment_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM experiments WHERE experiment_id = ?", (experiment_id,)
+        ).fetchone()
+
+    def list_experiment_arms(self, experiment_id: str) -> list[sqlite3.Row]:
+        return list(
+            self.conn.execute(
+                """SELECT * FROM experiment_arms
+                   WHERE experiment_id = ?
+                   ORDER BY is_control DESC, variant ASC""",
+                (experiment_id,),
+            ).fetchall()
+        )
+
+    def active_experiment_dimension(self, workflow_id: str, cohort_id: str) -> str | None:
+        """Return dimension of a non-terminal experiment for this workflow/cohort, if any."""
+        row = self.conn.execute(
+            """SELECT dimension FROM experiments
+               WHERE workflow_id = ? AND cohort_id = ?
+                 AND status IN ('planned', 'running')
+               ORDER BY experiment_id LIMIT 1""",
+            (workflow_id, cohort_id),
+        ).fetchone()
+        return row["dimension"] if row else None
+
 
 class _Transaction:
     def __init__(self, conn: sqlite3.Connection):

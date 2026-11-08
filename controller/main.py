@@ -16,6 +16,7 @@ from controller.api.client import SimulatorClient, SimulatorError
 from controller.api.models import ChunkMeta, SimState, Workflow, WorkflowConfig
 from controller.persistence.repositories import IngestIntegrityError, Store
 from controller.services.detector import detect_all
+from controller.services.experiments import run_all_experiments
 from controller.services.ingestion import ingest_available
 from controller.services.joiner import WorkflowConfigRef, project_events
 from controller.services.metrics import compute_and_store_workflow_views
@@ -146,6 +147,7 @@ def main(argv: list[str] | None = None) -> int:
                 workflow_ids = [cfg.workflow_id for cfg in report.configs]
                 kpi_slices = compute_and_store_workflow_views(store, workflow_ids)
                 signals = detect_all(store, workflow_ids)
+                experiments = run_all_experiments(store, report.workflows, report.configs)
             finally:
                 store.close()
     except (SimulatorError, IngestIntegrityError) as exc:
@@ -191,6 +193,20 @@ def main(argv: list[str] | None = None) -> int:
             f"  signal {signal.workflow_id} {signal.signal_type} severity={signal.severity} "
             f"{signal.message}"
         )
+    print(f"experiments={len(experiments)}")
+    for exp in experiments:
+        print(
+            f"  experiment {exp.experiment_id} status={exp.status} decision={exp.decision} "
+            f"winner={exp.winner_variant or '-'} reason={exp.decision_reason}"
+        )
+        for arm in exp.arms:
+            rate = "n/a" if arm.primary_rate is None else f"{arm.primary_rate:.4f}"
+            print(
+                f"    arm {arm.variant} control={str(arm.is_control).lower()} "
+                f"n={arm.sample_n} sample_ok={str(arm.sample_ok).lower()} "
+                f"primary={rate} verdict={arm.verdict or '-'} "
+                f"p={arm.p_value if arm.p_value is not None else 'n/a'}"
+            )
     for workflow, config in zip(report.workflows, report.configs, strict=True):
         print(
             f"  {workflow.workflow_id} version={config.version} primary={workflow.objective.primary} "

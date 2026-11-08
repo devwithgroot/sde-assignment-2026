@@ -10,7 +10,7 @@ import json
 import httpx
 import pytest
 
-from controller.api.client import SimulatorClient
+from controller.api.client import SimulatorClient, SimulatorError
 from controller.persistence.repositories import Store
 from controller.services.ingestion import ingest_available
 
@@ -25,7 +25,7 @@ def live_client():
             max_retries=1,
         )
         client.health()
-    except (httpx.TransportError, OSError):
+    except (httpx.TransportError, OSError, SimulatorError):
         pytest.skip("simulator is not running at http://127.0.0.1:8700")
     yield client
     client.close()
