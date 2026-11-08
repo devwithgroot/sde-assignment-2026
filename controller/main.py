@@ -16,6 +16,7 @@ from controller.api.client import SimulatorClient, SimulatorError
 from controller.api.models import ChunkMeta, SimState, Workflow, WorkflowConfig
 from controller.persistence.repositories import IngestIntegrityError, Store
 from controller.services.ingestion import ingest_available
+from controller.services.joiner import WorkflowConfigRef, project_events
 from controller.settings import Settings
 
 log = logging.getLogger("controller")
@@ -123,6 +124,23 @@ def main(argv: list[str] | None = None) -> int:
             store = Store(settings.db_path)
             try:
                 ingested = ingest_available(client, store)
+                projected = project_events(
+                    store,
+                    [
+                        WorkflowConfigRef(workflow_id=cfg.workflow_id, version=cfg.version, config=cfg.config)
+                        for cfg in report.configs
+                    ],
+                )
+                summary = {
+                    "campaigns": store.table_count("campaigns"),
+                    "leads": store.table_count("leads"),
+                    "calls": store.table_count("calls"),
+                    "unmatched_calls": store.unmatched_call_count(),
+                    "cohort_assignments": store.table_count("cohort_assignments"),
+                    "returning_people": store.returning_person_count(),
+                    "concluded_leads": store.concluded_lead_count(),
+                    "projection_cursor": store.projection_cursor(),
+                }
             finally:
                 store.close()
     except (SimulatorError, IngestIntegrityError) as exc:
@@ -141,6 +159,17 @@ def main(argv: list[str] | None = None) -> int:
             f"ingest kind={item.kind} fetched={item.chunks_fetched} committed={item.chunks_committed} "
             f"inserted={item.inserted} duplicates={item.duplicates} issues={item.issues}"
         )
+    print(
+        f"project processed={projected.processed} campaigns={projected.campaigns} leads={projected.leads} "
+        f"calls={projected.calls} repaired={projected.repaired_calls} assignments={projected.cohort_assignments} "
+        f"last_event_id={projected.last_event_id}"
+    )
+    print(
+        f"join campaigns={summary['campaigns']} leads={summary['leads']} calls={summary['calls']} "
+        f"unmatched={summary['unmatched_calls']} assignments={summary['cohort_assignments']} "
+        f"returning_people={summary['returning_people']} concluded_leads={summary['concluded_leads']} "
+        f"cursor={summary['projection_cursor']}"
+    )
     for workflow, config in zip(report.workflows, report.configs, strict=True):
         print(
             f"  {workflow.workflow_id} version={config.version} primary={workflow.objective.primary} "

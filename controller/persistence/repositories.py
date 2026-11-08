@@ -168,6 +168,109 @@ class Store:
             (kind, chunk, event_id, now),
         )
 
+    def projection_cursor(self) -> int:
+        row = self.conn.execute("SELECT last_event_id FROM projection_state WHERE id = 1").fetchone()
+        return int(row["last_event_id"]) if row is not None else 0
+
+    def set_projection_cursor(self, last_event_id: int) -> None:
+        self.conn.execute(
+            """INSERT INTO projection_state (id, last_event_id, updated_at)
+               VALUES (1, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                 last_event_id = excluded.last_event_id,
+                 updated_at = excluded.updated_at""",
+            (last_event_id, _now()),
+        )
+
+    def iter_events_after(self, after_event_id: int):
+        cursor = self.conn.execute(
+            """SELECT event_id, type, raw_json FROM events
+               WHERE event_id > ?
+               ORDER BY event_id ASC""",
+            (after_event_id,),
+        )
+        while True:
+            rows = cursor.fetchmany(1000)
+            if not rows:
+                break
+            for row in rows:
+                yield dict(row)
+
+    def lead_exists(self, lead_id: str) -> bool:
+        row = self.conn.execute("SELECT 1 FROM leads WHERE lead_id = ?", (lead_id,)).fetchone()
+        return row is not None
+
+    def campaign_exists(self, campaign_id: str) -> bool:
+        row = self.conn.execute("SELECT 1 FROM campaigns WHERE campaign_id = ?", (campaign_id,)).fetchone()
+        return row is not None
+
+    def repair_calls_for_lead(self, lead_id: str, campaign_id: str) -> int:
+        before = self.conn.total_changes
+        self.conn.execute(
+            """UPDATE calls
+               SET lead_matched = 1,
+                   campaign_matched = CASE
+                       WHEN campaign_id = ? THEN 1
+                       WHEN EXISTS (SELECT 1 FROM campaigns c WHERE c.campaign_id = calls.campaign_id) THEN 1
+                       ELSE campaign_matched
+                   END
+               WHERE lead_id = ? AND lead_matched = 0""",
+            (campaign_id, lead_id),
+        )
+        return max(self.conn.total_changes - before, 0)
+
+    def upsert_cohort_assignment(
+        self,
+        lead_id: str,
+        workflow_id: str,
+        config_version: int,
+        cohort_id: str,
+        source: str,
+    ) -> None:
+        self.conn.execute(
+            """INSERT INTO cohort_assignments (lead_id, workflow_id, config_version, cohort_id, source)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(lead_id, config_version) DO UPDATE SET
+                 cohort_id = excluded.cohort_id,
+                 source = excluded.source,
+                 workflow_id = excluded.workflow_id""",
+            (lead_id, workflow_id, config_version, cohort_id, source),
+        )
+
+    def table_count(self, table: str) -> int:
+        allowed = {
+            "campaigns",
+            "leads",
+            "calls",
+            "config_changes",
+            "approval_decisions",
+            "cohort_assignments",
+            "events",
+        }
+        if table not in allowed:
+            raise ValueError(table)
+        row = self.conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()
+        return int(row["n"])
+
+    def unmatched_call_count(self) -> int:
+        row = self.conn.execute("SELECT COUNT(*) AS n FROM calls WHERE lead_matched = 0").fetchone()
+        return int(row["n"])
+
+    def returning_person_count(self) -> int:
+        row = self.conn.execute(
+            """SELECT COUNT(*) AS n FROM (
+                   SELECT person_id FROM leads GROUP BY person_id HAVING COUNT(DISTINCT campaign_id) > 1
+               )"""
+        ).fetchone()
+        return int(row["n"])
+
+    def concluded_lead_count(self) -> int:
+        row = self.conn.execute(
+            """SELECT COUNT(DISTINCT lead_id) AS n FROM calls
+               WHERE concluded = 1 AND lead_id IS NOT NULL"""
+        ).fetchone()
+        return int(row["n"])
+
 
 class _Transaction:
     def __init__(self, conn: sqlite3.Connection):
