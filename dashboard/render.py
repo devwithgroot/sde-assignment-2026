@@ -284,6 +284,59 @@ def render_html(snap: DashboardSnapshot) -> str:
     else:
         audit_block = """<p class="warn">Audit store unavailable.</p>"""
 
+    llm_rows = [
+        [
+            escape(str(r.get("attempt_id"))),
+            escape(str(r.get("incident_id"))),
+            escape(str(r.get("workflow_id"))),
+            escape(str(r.get("status"))),
+            escape(str(r.get("selected_prompt_version") or "-")),
+            escape(str(r.get("selected_validation_run_id") or "-")),
+            escape(str(r.get("related_proposal_id") or "-")),
+            escape(str(r.get("error_code") or "")),
+            escape(str(r.get("problem") or "")[:100]),
+        ]
+        for r in snap.llm_attempts
+    ]
+    if snap.llm_attempts_available:
+        llm_block = (
+            f"""
+      <p class="note">LLM suggestions are untrusted candidates. Selection uses validation thresholds, not the LLM.</p>
+      {_rows(["attempt", "incident", "workflow", "status", "prompt", "validation", "proposal", "error", "problem"], llm_rows)}
+"""
+            if snap.llm_attempts
+            else """<p class="warn">No LLM suggestion attempts stored yet.</p>"""
+        )
+    else:
+        llm_block = """<p class="warn">LLM suggestion table unavailable.</p>"""
+
+    validation_rows = [
+        [
+            escape(str(r.get("record_id"))),
+            escape(str(r.get("attempt_id"))),
+            escape(str(r.get("incident_id"))),
+            escape(str(r.get("prompt_version"))),
+            _fmt_int(r.get("n")),
+            escape(str(r.get("validation_run_id") or "-")),
+            _fmt_rate(r.get("pass_rate")),
+            "yes" if r.get("meets_threshold") else "no",
+            escape(str(r.get("status"))),
+            escape(str(r.get("error_code") or "")),
+        ]
+        for r in snap.validation_records
+    ]
+    if snap.validation_available:
+        validation_block = (
+            f"""
+      <p class="note">Validation measures safety only. Failed/invalid runs never become approved changes by themselves.</p>
+      {_rows(["record", "attempt", "incident", "prompt", "n", "run_id", "pass_rate", "meets_min", "status", "error"], validation_rows)}
+"""
+            if snap.validation_records
+            else """<p class="warn">No validation records stored yet.</p>"""
+        )
+    else:
+        validation_block = """<p class="warn">Validation records unavailable.</p>"""
+
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -439,9 +492,17 @@ def render_html(snap: DashboardSnapshot) -> str:
       {audit_block}
     </section>
     <section>
+      <h2>LLM suggestion attempts</h2>
+      {llm_block}
+    </section>
+    <section>
+      <h2>Validation runs</h2>
+      {validation_block}
+    </section>
+    <section>
       <h2>Not implemented yet</h2>
       {_rows(["area", "detail", "status"], unimplemented_rows)}
-      <p class="note">Phase 7+ surfaces (prompt LLM/validation loop, fairness scheduler UI) remain unavailable.</p>
+      <p class="note">Phase 8+ surfaces (fairness scheduler UI) remain unavailable.</p>
     </section>
   </main>
 </body>

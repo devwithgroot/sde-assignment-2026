@@ -1,14 +1,14 @@
 # Implementation status
 
-Phases 0–6 are done. Phase 6 adds incidents, governed proposals/approvals/apply, decay-aware rollback proposals, audit, and dashboard panels for those stores. Phase 7 (prompt LLM/validation incident loop) has not started.
+Phases 0–7 are done. Phase 7 adds hallucination incident remediation via untrusted LLM suggest-fixes, validation runs, and governed prompt proposals. Phase 8 has not started.
 
 Per-phase details:
 
-- `docs/IMPLEMENTATION_STATUS_PHASE1.md` … `PHASE5.md`
-- `docs/IMPLEMENTATION_STATUS_PHASE6.md` — incidents + governance + audit + dashboard
+- `docs/IMPLEMENTATION_STATUS_PHASE1.md` … `PHASE6.md`
+- `docs/IMPLEMENTATION_STATUS_PHASE7.md` — LLM suggest-fixes + validation + prompt proposals
 - `docs/DASHBOARD.md` — read-only monitor
 
-Checked on 8 Nov 2026 with `.venv` Python 3.11.9. Full suite: `78 passed, 1 skipped`.
+Checked on 8 Nov 2026 with `.venv` Python 3.11.9. Full suite: `86 passed` (live ingest skips when simulator is down).
 
 ## Repository inventory
 

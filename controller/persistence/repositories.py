@@ -254,6 +254,8 @@ class Store:
             "controller_approvals",
             "audit_decisions",
             "config_snapshots",
+            "llm_suggestion_attempts",
+            "validation_run_records",
         }
         if table not in allowed:
             raise ValueError(table)
@@ -973,6 +975,123 @@ class Store:
                 (workflow_id,),
             ).fetchall()
         )
+
+    def upsert_llm_attempt(self, attempt) -> None:
+        self.conn.execute(
+            """INSERT INTO llm_suggestion_attempts (
+                   attempt_id, incident_id, workflow_id, status, problem, request_json, response_json,
+                   error_code, error_detail, credits_before, credits_after, selected_prompt_version,
+                   selected_validation_run_id, related_proposal_id, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(attempt_id) DO UPDATE SET
+                 status = excluded.status,
+                 request_json = excluded.request_json,
+                 response_json = excluded.response_json,
+                 error_code = excluded.error_code,
+                 error_detail = excluded.error_detail,
+                 credits_before = excluded.credits_before,
+                 credits_after = excluded.credits_after,
+                 selected_prompt_version = excluded.selected_prompt_version,
+                 selected_validation_run_id = excluded.selected_validation_run_id,
+                 related_proposal_id = excluded.related_proposal_id,
+                 updated_at = excluded.updated_at""",
+            (
+                attempt.attempt_id,
+                attempt.incident_id,
+                attempt.workflow_id,
+                attempt.status,
+                attempt.problem,
+                json.dumps(attempt.request, sort_keys=True) if attempt.request is not None else None,
+                json.dumps(attempt.response, sort_keys=True) if attempt.response is not None else None,
+                attempt.error_code,
+                attempt.error_detail,
+                attempt.credits_before,
+                attempt.credits_after,
+                attempt.selected_prompt_version,
+                attempt.selected_validation_run_id,
+                attempt.related_proposal_id,
+                attempt.created_at,
+                attempt.updated_at,
+            ),
+        )
+
+    def get_llm_attempt(self, attempt_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM llm_suggestion_attempts WHERE attempt_id = ?", (attempt_id,)
+        ).fetchone()
+
+    def list_llm_attempts(self, incident_id: str | None = None) -> list[sqlite3.Row]:
+        if incident_id is None:
+            return list(
+                self.conn.execute("SELECT * FROM llm_suggestion_attempts ORDER BY updated_at DESC").fetchall()
+            )
+        return list(
+            self.conn.execute(
+                """SELECT * FROM llm_suggestion_attempts WHERE incident_id = ?
+                   ORDER BY updated_at DESC""",
+                (incident_id,),
+            ).fetchall()
+        )
+
+    def upsert_validation_record(self, record) -> None:
+        self.conn.execute(
+            """INSERT INTO validation_run_records (
+                   record_id, attempt_id, incident_id, workflow_id, prompt_version, n,
+                   validation_run_id, pass_rate, failures, status, credits_after,
+                   error_code, error_detail, meets_threshold, raw_json, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(record_id) DO UPDATE SET
+                 validation_run_id = excluded.validation_run_id,
+                 pass_rate = excluded.pass_rate,
+                 failures = excluded.failures,
+                 status = excluded.status,
+                 credits_after = excluded.credits_after,
+                 error_code = excluded.error_code,
+                 error_detail = excluded.error_detail,
+                 meets_threshold = excluded.meets_threshold,
+                 raw_json = excluded.raw_json,
+                 updated_at = excluded.updated_at""",
+            (
+                record.record_id,
+                record.attempt_id,
+                record.incident_id,
+                record.workflow_id,
+                record.prompt_version,
+                record.n,
+                record.validation_run_id,
+                record.pass_rate,
+                record.failures,
+                record.status,
+                record.credits_after,
+                record.error_code,
+                record.error_detail,
+                1 if record.meets_threshold else 0,
+                json.dumps(record.raw, sort_keys=True) if record.raw is not None else None,
+                record.created_at,
+                record.updated_at,
+            ),
+        )
+
+    def list_validation_records(
+        self, *, attempt_id: str | None = None, incident_id: str | None = None
+    ) -> list[sqlite3.Row]:
+        if attempt_id is not None:
+            return list(
+                self.conn.execute(
+                    """SELECT * FROM validation_run_records WHERE attempt_id = ?
+                       ORDER BY created_at""",
+                    (attempt_id,),
+                ).fetchall()
+            )
+        if incident_id is not None:
+            return list(
+                self.conn.execute(
+                    """SELECT * FROM validation_run_records WHERE incident_id = ?
+                       ORDER BY created_at""",
+                    (incident_id,),
+                ).fetchall()
+            )
+        return list(self.conn.execute("SELECT * FROM validation_run_records ORDER BY created_at DESC").fetchall())
 
 
 class _Transaction:

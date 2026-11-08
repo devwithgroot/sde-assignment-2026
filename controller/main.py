@@ -23,6 +23,7 @@ from controller.services.incidents import link_incident_experiment, sync_inciden
 from controller.services.ingestion import ingest_available
 from controller.services.joiner import WorkflowConfigRef, project_events
 from controller.services.metrics import compute_and_store_workflow_views
+from controller.services.prompt_incident import PromptIncidentReport, run_prompt_incident_cycle
 from controller.settings import Settings
 
 log = logging.getLogger("controller")
@@ -131,6 +132,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     configure_logging(settings.log_level)
     governance_report = GovernanceReport(notes=["governance not run"])
+    prompt_report = PromptIncidentReport(notes=["prompt incident loop not run"])
     incidents: list = []
     decay_hits: list = []
     try:
@@ -176,6 +178,14 @@ def main(argv: list[str] | None = None) -> int:
                         }:
                             link_incident_experiment(store, incident.incident_id, exp.experiment_id)
                 decay_hits = detect_promoted_decay(store)
+                prompt_report = run_prompt_incident_cycle(
+                    client,
+                    store,
+                    report.workflows,
+                    report.configs,
+                    report.state,
+                    mutate=settings.governance_enabled,
+                )
                 governance_report = run_governance_cycle(
                     client,
                     store,
@@ -254,6 +264,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"decay_hits={len(decay_hits)}")
     for hit in decay_hits:
         print(f"  decay {hit.get('workflow_id')} {hit.get('reason')}")
+    print(
+        f"prompt_incidents eligible={prompt_report.eligible} attempted={prompt_report.attempted} "
+        f"suggested={prompt_report.suggested} validated={prompt_report.validated} "
+        f"proposed={prompt_report.proposed} submitted={prompt_report.submitted} "
+        f"skipped_no_mutate={prompt_report.skipped_no_mutate} "
+        f"skipped_dup={prompt_report.skipped_duplicate} credit_blocked={prompt_report.credit_blocked}"
+    )
+    for note in prompt_report.notes:
+        print(f"  prompt_note {note}")
     print(
         f"governance mutate={str(settings.governance_enabled).lower()} "
         f"proposals={governance_report.proposals_built} submitted={governance_report.proposals_submitted} "

@@ -16,7 +16,6 @@ from controller.persistence.db import connect, init_schema
 
 
 UNIMPLEMENTED = (
-    ("prompt_incident_loop", "LLM suggest-fixes + validation-driven prompt incident loop (Phase 7)"),
     ("fairness_scheduler", "Tenant/workflow fair scheduler and credit reserve policy UI (Phase 8)"),
 )
 
@@ -49,6 +48,10 @@ class DashboardSnapshot:
     approvals_available: bool = False
     audit_decisions: list[dict[str, Any]] = field(default_factory=list)
     audit_available: bool = False
+    llm_attempts: list[dict[str, Any]] = field(default_factory=list)
+    llm_attempts_available: bool = False
+    validation_records: list[dict[str, Any]] = field(default_factory=list)
+    validation_available: bool = False
     unimplemented: list[dict[str, str]] = field(default_factory=list)
     simulator: dict[str, Any] | None = None
 
@@ -119,6 +122,8 @@ def load_snapshot(db_path: str | Path, *, simulator: dict[str, Any] | None = Non
             "controller_approvals",
             "audit_decisions",
             "config_snapshots",
+            "llm_suggestion_attempts",
+            "validation_run_records",
         ):
             snap.counts[table] = _count(conn, table)
 
@@ -314,6 +319,37 @@ def load_snapshot(db_path: str | Path, *, simulator: dict[str, Any] | None = Non
         else:
             snap.audit_available = False
             snap.warnings.append("audit_decisions table missing — run Phase 6 controller once.")
+
+        if _table_exists(conn, "llm_suggestion_attempts"):
+            snap.llm_attempts_available = True
+            snap.llm_attempts = []
+            for row in conn.execute("SELECT * FROM llm_suggestion_attempts ORDER BY updated_at DESC"):
+                item = dict(row)
+                item["request"] = _parse_json(item.get("request_json"))
+                item["response"] = _parse_json(item.get("response_json"))
+                snap.llm_attempts.append(item)
+            if not snap.llm_attempts:
+                snap.warnings.append("No LLM suggestion attempts yet.")
+            else:
+                pending = [a for a in snap.llm_attempts if a.get("status") in {"pending", "validating", "proposed"}]
+                if pending:
+                    snap.warnings.append(f"{len(pending)} LLM/validation attempt(s) still in progress.")
+        else:
+            snap.llm_attempts_available = False
+            snap.warnings.append("llm_suggestion_attempts missing — run Phase 7 controller once.")
+
+        if _table_exists(conn, "validation_run_records"):
+            snap.validation_available = True
+            snap.validation_records = []
+            for row in conn.execute("SELECT * FROM validation_run_records ORDER BY updated_at DESC"):
+                item = dict(row)
+                item["raw"] = _parse_json(item.get("raw_json"))
+                snap.validation_records.append(item)
+            if not snap.validation_records:
+                snap.warnings.append("No validation run records yet.")
+        else:
+            snap.validation_available = False
+            snap.warnings.append("validation_run_records missing — run Phase 7 controller once.")
 
         if snap.counts.get("events", 0) == 0:
             snap.warnings.append("No events ingested yet.")

@@ -38,7 +38,9 @@ JSON snapshot: [http://127.0.0.1:8800/api/snapshot](http://127.0.0.1:8800/api/sn
 - **Proposals** — source, route, dims, impact, affected leads, dry-run limitation note, status
 - **Controller approvals** — pending/approved/rejected/expired/lapsed/applied, expiry, apply_by, reasons
 - **Audit decisions** — controller action history
-- Explicit **not implemented yet** for Phase 7+ (prompt LLM loop, fairness scheduler UI)
+- **LLM suggestion attempts** — status, selected prompt, validation id, linked proposal (suggestions are untrusted)
+- **Validation runs** — pass_rate, threshold meet/fail, errors
+- Explicit **not implemented yet** for Phase 8+ (fairness scheduler UI)
 
 ## Insufficient / unavailable data
 

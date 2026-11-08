@@ -230,6 +230,93 @@ def build_winner_proposal(
     )
 
 
+def build_prompt_proposal(
+    store: Store,
+    workflow: Workflow,
+    config: WorkflowConfig,
+    *,
+    prompt_version: str,
+    validation_run_id: str,
+    pass_rate: float,
+    incident_id: str,
+    attempt_id: str,
+    problem: str,
+) -> ProposalDraft | None:
+    """Prompt change proposal. Requires a validation_run_id; never invents prompt versions."""
+    allowed = set(workflow.options.prompt_version or [])
+    if prompt_version not in allowed:
+        return None
+    current_prompt = (config.config or {}).get("prompt_version")
+    if current_prompt == prompt_version:
+        return None
+    proposed = copy.deepcopy(config.config)
+    proposed["prompt_version"] = prompt_version
+    dims = changed_dims(config.config, proposed)
+    if dims != ["prompt_version"]:
+        # Only the prompt dimension may change in this builder.
+        return None
+    threshold = float(workflow.governance.min_validation_pass_rate)
+    dry = {
+        "label": "prompt_validation_safety_only",
+        "limitation": (
+            "Validation pass_rate measures synthetic safety/hallucination only; "
+            "it does not prove engagement or business-outcome improvement."
+        ),
+        "validation_run_id": validation_run_id,
+        "pass_rate": pass_rate,
+        "min_validation_pass_rate": threshold,
+        "sample_ok": True,
+        "guardrail_ok": True,
+        "impact_score": round(min(1.0, max(0.0, 0.35 + max(0.0, pass_rate - threshold))), 4),
+    }
+    affected = store.uploaded_leads(workflow.workflow_id)
+    summary = f"Replace prompt_version {current_prompt} → {prompt_version} on {workflow.workflow_id}"
+    rationale = (
+        f"Hallucination incident {incident_id}: validated candidate {prompt_version} "
+        f"(pass_rate={pass_rate:.4f} ≥ {threshold:.4f}). Problem: {problem}"
+    )
+    pid = proposal_id_for(
+        "prompt_incident",
+        incident_id,
+        attempt_id,
+        prompt_version,
+        validation_run_id,
+        config.version,
+    )
+    now = _now()
+    return ProposalDraft(
+        proposal_id=pid,
+        workflow_id=workflow.workflow_id,
+        base_version=config.version,
+        status="draft",
+        source="prompt_incident",
+        source_ref=incident_id,
+        changed_dims=dims,
+        proposed_config=proposed,
+        change_summary=summary,
+        diff={
+            "changed_dims": dims,
+            "prompt_version": {"from": current_prompt, "to": prompt_version},
+            "validation_run_id": validation_run_id,
+            "pass_rate": pass_rate,
+        },
+        dry_run=dry,
+        impact_score=float(dry["impact_score"]),
+        affected_leads=int(affected),
+        rationale=rationale,
+        evidence={
+            "validation_run_id": validation_run_id,
+            "incident_id": incident_id,
+            "attempt_id": attempt_id,
+            "pass_rate": pass_rate,
+            "min_validation_pass_rate": threshold,
+            "untrusted_llm_note": "LLM suggested candidates only; selection used validation threshold, not the LLM.",
+        },
+        created_at=now,
+        updated_at=now,
+    )
+
+
 def build_rollback_proposal(
     store: Store,
     workflow: Workflow,

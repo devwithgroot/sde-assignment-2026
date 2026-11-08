@@ -133,6 +133,38 @@ class SimulatorClient:
             )
         return payload
 
+    def suggest_fixes(self, *, workflow_id: str, problem: str) -> dict[str, Any]:
+        """POST /llm/suggest-fixes. Costs credits; suggestions are untrusted candidates."""
+        payload = self._json_request(
+            "POST", "/llm/suggest-fixes", {"workflow_id": workflow_id, "problem": problem}
+        )
+        if not isinstance(payload, dict):
+            raise SimulatorError(
+                status=200,
+                code="bad_response",
+                detail="suggest-fixes was not an object",
+                endpoint="/llm/suggest-fixes",
+                body=payload,
+            )
+        return payload
+
+    def run_validation(self, *, workflow_id: str, prompt_version: str, n: int) -> dict[str, Any]:
+        """POST /validation/runs. Safety-only pass_rate; costs ceil(n/100) credits."""
+        payload = self._json_request(
+            "POST",
+            "/validation/runs",
+            {"workflow_id": workflow_id, "prompt_version": prompt_version, "n": n},
+        )
+        if not isinstance(payload, dict):
+            raise SimulatorError(
+                status=200,
+                code="bad_response",
+                detail="validation was not an object",
+                endpoint="/validation/runs",
+                body=payload,
+            )
+        return payload
+
     def _get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
         response = self._request("GET", path, params=params)
         try:

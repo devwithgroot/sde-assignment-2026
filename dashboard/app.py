@@ -77,6 +77,10 @@ def create_app(db_path: str, sim_url: str | None = None) -> FastAPI:
                 "controller_approvals": snap.controller_approvals,
                 "audit_available": snap.audit_available,
                 "audit_decisions": snap.audit_decisions,
+                "llm_attempts_available": snap.llm_attempts_available,
+                "llm_attempts": snap.llm_attempts,
+                "validation_available": snap.validation_available,
+                "validation_records": snap.validation_records,
                 "unimplemented": snap.unimplemented,
                 "simulator": snap.simulator,
             }

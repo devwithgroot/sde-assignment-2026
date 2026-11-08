@@ -285,10 +285,11 @@ def test_snapshot_phase5_without_fabricated_governance(tmp_path):
     assert snap.proposals_available is True
     assert snap.incidents == []
     assert snap.proposals == []
-    assert "prompt_incident_loop" in {u["key"] for u in snap.unimplemented}
+    assert "fairness_scheduler" in {u["key"] for u in snap.unimplemented}
     html = render_html(snap)
     assert "Incidents" in html
     assert "No incident rows" in html or "empty" in html.lower()
+    assert "LLM suggestion" in html
 
 
 def test_snapshot_shows_real_phase6_rows(tmp_path):
@@ -305,6 +306,8 @@ def test_snapshot_shows_real_phase6_rows(tmp_path):
     assert snap.proposals[0]["proposal_id"] in html
     assert "apr_dash" in html
     assert "Audit decisions" in html
+    assert snap.llm_attempts_available is True
+    assert snap.validation_available is True
 
 
 def test_http_endpoints_are_get_only(tmp_path):

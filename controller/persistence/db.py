@@ -359,9 +359,53 @@ CREATE INDEX IF NOT EXISTS idx_incidents_workflow ON incidents(workflow_id, stat
 CREATE INDEX IF NOT EXISTS idx_proposals_workflow ON proposals(workflow_id, status);
 CREATE INDEX IF NOT EXISTS idx_controller_approvals_workflow ON controller_approvals(workflow_id, status);
 CREATE INDEX IF NOT EXISTS idx_audit_decisions_workflow ON audit_decisions(workflow_id, wall_ts);
+
+CREATE TABLE IF NOT EXISTS llm_suggestion_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    incident_id TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    problem TEXT NOT NULL,
+    request_json TEXT,
+    response_json TEXT,
+    error_code TEXT,
+    error_detail TEXT,
+    credits_before REAL,
+    credits_after REAL,
+    selected_prompt_version TEXT,
+    selected_validation_run_id TEXT,
+    related_proposal_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS validation_run_records (
+    record_id TEXT PRIMARY KEY,
+    attempt_id TEXT NOT NULL,
+    incident_id TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    n INTEGER NOT NULL,
+    validation_run_id TEXT,
+    pass_rate REAL,
+    failures INTEGER,
+    status TEXT NOT NULL,
+    credits_after REAL,
+    error_code TEXT,
+    error_detail TEXT,
+    meets_threshold INTEGER NOT NULL DEFAULT 0,
+    raw_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (attempt_id) REFERENCES llm_suggestion_attempts(attempt_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_llm_attempts_incident ON llm_suggestion_attempts(incident_id, status);
+CREATE INDEX IF NOT EXISTS idx_validation_records_attempt ON validation_run_records(attempt_id);
+CREATE INDEX IF NOT EXISTS idx_validation_records_incident ON validation_run_records(incident_id);
 """
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def connect(path: Path) -> sqlite3.Connection:
