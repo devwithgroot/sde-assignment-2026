@@ -14,17 +14,31 @@ from datetime import datetime, timezone
 from typing import Any
 
 from controller.api.models import Workflow, WorkflowConfig
-from controller.domain.cohorts import DEFAULT_COHORT_ID
+from controller.domain.cohorts import DEFAULT_COHORT_ID, MIN_COHORT_SAMPLE
 from controller.persistence.repositories import Store
+from controller.services.detector import CALLER_ID_DROP_VS_WORKFLOW
 from controller.services.experiments import (
+    DEFAULT_MIN_EFFECT,
     ExperimentState,
     allocation_diff,
     balanced_allocation,
     dry_run_impact,
+    normalize_primary_kpi,
+    parse_guardrail,
 )
+from controller.services.incidents import Incident
+from controller.services.metrics import KpiSlice
 
 
 ALLOCATION_DIMS = ("welcome_message", "voice", "caller_id")
+CALLER_ID_ROTATION_SOURCE = "caller_id_rotation"
+# One proposal may move at most this much probability mass off the degraded caller id.
+# 0.15 is enough that a later window can show whether pickup moved, and it leaves a
+# residual when that id currently holds more than 0.15. It is not a full replacement.
+# auto_apply still enforces the workflow's own max_shift; a tighter policy uses approval.
+CALLER_ID_ROTATION_MAX_SHIFT = 0.15
+# Same absolute pickup gap the detector uses. A replacement must clear this bar.
+CALLER_ID_MIN_PICKUP_LIFT = CALLER_ID_DROP_VS_WORKFLOW
 
 
 @dataclass
@@ -656,6 +670,389 @@ def build_rollback_proposal(
         },
         created_at=now,
         updated_at=now,
+    )
+
+
+@dataclass(frozen=True)
+class CallerIdRotationBuild:
+    draft: ProposalDraft | None
+    reason: str | None
+    details: dict[str, Any]
+
+
+def _caller_rate(slice_, kpi: str) -> tuple[float | None, int]:
+    if kpi == "pickup":
+        return slice_.pickup, slice_.dials
+    if kpi == "engagement":
+        return slice_.engagement, slice_.connected
+    # Conclusion needs uploaded leads. Caller-id slices do not have that denominator.
+    return None, 0
+
+
+def _rate_ok(rate: float | None, n: int) -> bool:
+    return rate is not None and n >= MIN_COHORT_SAMPLE
+
+
+def _cohort_slice(
+    store: Store,
+    workflow_id: str,
+    *,
+    cohort_id: str,
+    caller_id: str | None,
+) -> KpiSlice:
+    """Call totals for one cohort, optionally one caller id. Both filters are applied together."""
+    dials, connected, engaged, halluc_flags, connected_with_qa = store.call_totals(
+        workflow_id,
+        cohort_id=cohort_id,
+        caller_id=caller_id,
+    )
+    return KpiSlice(
+        workflow_id=workflow_id,
+        window_label="all",
+        window_start_ts=None,
+        window_end_ts=None,
+        cohort_id=cohort_id,
+        caller_id=caller_id,
+        config_version=None,
+        dials=dials,
+        connected=connected,
+        engaged=engaged,
+        uploaded_leads=None,
+        concluded_leads=0,
+        halluc_flags=halluc_flags,
+        connected_with_qa=connected_with_qa,
+    )
+
+
+def _cohorts_holding_caller(config: dict[str, Any], caller_id: str) -> list[str]:
+    allocs = config.get("allocations") or {}
+    if not isinstance(allocs, dict):
+        return []
+    found: list[str] = []
+    for cohort in allocs:
+        weights = _allocation_weights(config, str(cohort), "caller_id")
+        if weights.get(caller_id, 0.0) > 0:
+            found.append(str(cohort))
+    return found
+
+
+def next_caller_id_attempt_seq(store: Store, incident_id: str) -> int:
+    """1-based retry count. A stale or lapsed row still counts, so the next id is new."""
+    n = 0
+    for row in store.list_proposals():
+        if row["source"] == CALLER_ID_ROTATION_SOURCE and row["source_ref"] == incident_id:
+            n += 1
+    return n + 1
+
+
+def build_caller_id_rotation_proposal(
+    store: Store,
+    workflow: Workflow,
+    config: WorkflowConfig,
+    incident: Incident,
+) -> CallerIdRotationBuild:
+    """Shift a limited share of the default cohort off one degraded caller id.
+
+    The incident names the degraded id. Pickup, sample size, primary KPI, and the
+    guardrail are read from calls in the default cohort only. A workflow-wide gap
+    that lives on a named cohort does not justify this edit. Only ids listed on
+    the workflow are eligible. Named-cohort allocations are left unchanged.
+    """
+    evidence = incident.evidence if isinstance(incident.evidence, dict) else {}
+    degraded = evidence.get("caller_id")
+    if not degraded:
+        return CallerIdRotationBuild(None, "missing_caller_id", {})
+    degraded = str(degraded)
+    allowed = [str(v) for v in (workflow.options.caller_id or []) if v is not None and str(v)]
+    if degraded not in allowed:
+        return CallerIdRotationBuild(
+            None,
+            "degraded_not_supported",
+            {"degraded_caller_id": degraded, "options": allowed},
+        )
+    alternatives = [cid for cid in allowed if cid != degraded]
+    if not alternatives:
+        return CallerIdRotationBuild(
+            None,
+            "no_supported_replacement",
+            {"degraded_caller_id": degraded, "options": allowed},
+        )
+
+    holders = _cohorts_holding_caller(config.config, degraded)
+    current = _allocation_weights(config.config, DEFAULT_COHORT_ID, "caller_id")
+    if degraded not in current:
+        reason = "cohort_specific_only" if any(c != DEFAULT_COHORT_ID for c in holders) else "degraded_not_allocated"
+        return CallerIdRotationBuild(
+            None,
+            reason,
+            {"degraded_caller_id": degraded, "cohorts_holding": holders},
+        )
+
+    bad = _cohort_slice(store, workflow.workflow_id, cohort_id=DEFAULT_COHORT_ID, caller_id=degraded)
+    if not _rate_ok(bad.pickup, bad.dials):
+        return CallerIdRotationBuild(
+            None,
+            "insufficient_samples",
+            {
+                "which": "degraded",
+                "cohort_id": DEFAULT_COHORT_ID,
+                "degraded_caller_id": degraded,
+                "dials": bad.dials,
+            },
+        )
+    cohort = _cohort_slice(store, workflow.workflow_id, cohort_id=DEFAULT_COHORT_ID, caller_id=None)
+    if not _rate_ok(cohort.pickup, cohort.dials):
+        return CallerIdRotationBuild(
+            None,
+            "insufficient_samples",
+            {"which": "default_cohort", "cohort_id": DEFAULT_COHORT_ID, "dials": cohort.dials},
+        )
+    drop = float(cohort.pickup) - float(bad.pickup)
+    if drop < CALLER_ID_DROP_VS_WORKFLOW:
+        return CallerIdRotationBuild(
+            None,
+            "signal_not_confirmed",
+            {
+                "degraded_caller_id": degraded,
+                "cohort_id": DEFAULT_COHORT_ID,
+                "degraded_pickup": bad.pickup,
+                "cohort_pickup": cohort.pickup,
+                "drop": drop,
+            },
+        )
+
+    primary = normalize_primary_kpi(workflow.objective.primary)
+    guard_kpi, guard_max_drop = parse_guardrail(workflow.objective.guardrail)
+    bad_guard, bad_guard_n = _caller_rate(bad, guard_kpi)
+    bad_primary, bad_primary_n = _caller_rate(bad, primary)
+    evaluated: list[dict[str, Any]] = []
+    for cid in alternatives:
+        sl = _cohort_slice(store, workflow.workflow_id, cohort_id=DEFAULT_COHORT_ID, caller_id=cid)
+        row: dict[str, Any] = {
+            "caller_id": cid,
+            "dials": sl.dials,
+            "connected": sl.connected,
+            "pickup": sl.pickup,
+            "reason": None,
+        }
+        if not _rate_ok(sl.pickup, sl.dials):
+            row["reason"] = "insufficient_samples"
+            evaluated.append(row)
+            continue
+        lift = float(sl.pickup) - float(bad.pickup)
+        row["pickup_lift"] = lift
+        if lift < CALLER_ID_MIN_PICKUP_LIFT:
+            row["reason"] = "no_meaningful_pickup_lift"
+            evaluated.append(row)
+            continue
+        cand_guard, cand_guard_n = _caller_rate(sl, guard_kpi)
+        if not _rate_ok(bad_guard, bad_guard_n) or not _rate_ok(cand_guard, cand_guard_n):
+            row["reason"] = "guardrail_not_evaluable"
+            row["guardrail_kpi"] = guard_kpi
+            evaluated.append(row)
+            continue
+        guard_drop = float(bad_guard) - float(cand_guard)
+        row["guardrail_drop"] = guard_drop
+        if guard_drop > guard_max_drop + 1e-9:
+            row["reason"] = "guardrail_violation"
+            row["guardrail_kpi"] = guard_kpi
+            evaluated.append(row)
+            continue
+        if primary != "pickup":
+            cand_primary, cand_primary_n = _caller_rate(sl, primary)
+            if not _rate_ok(bad_primary, bad_primary_n) or not _rate_ok(cand_primary, cand_primary_n):
+                row["reason"] = "primary_not_evaluable"
+                row["primary_kpi"] = primary
+                evaluated.append(row)
+                continue
+            if float(cand_primary) < float(bad_primary) - DEFAULT_MIN_EFFECT:
+                row["reason"] = "primary_regression"
+                row["primary_kpi"] = primary
+                row["primary_drop"] = float(bad_primary) - float(cand_primary)
+                evaluated.append(row)
+                continue
+            row["primary_rate"] = cand_primary
+        row["slice_connected"] = sl.connected
+        row["slice_engaged"] = sl.engaged
+        evaluated.append(row)
+
+    passed = [row for row in evaluated if row["reason"] is None]
+    if not passed:
+        ranked = sorted(
+            evaluated,
+            key=lambda row: (-(row["pickup"] if isinstance(row.get("pickup"), float) else -1.0), row["caller_id"]),
+        )
+        reason = str(ranked[0]["reason"]) if ranked else "no_supported_replacement"
+        return CallerIdRotationBuild(
+            None,
+            reason,
+            {"degraded_caller_id": degraded, "candidates": evaluated},
+        )
+    passed.sort(key=lambda row: (-float(row["pickup"]), row["caller_id"]))
+    chosen = passed[0]
+    replacement = str(chosen["caller_id"])
+    if replacement not in allowed:
+        return CallerIdRotationBuild(None, "no_supported_replacement", {"replacement": replacement})
+
+    move = min(CALLER_ID_ROTATION_MAX_SHIFT, float(current[degraded]))
+    if move <= 1e-9:
+        return CallerIdRotationBuild(None, "no_allocation_change", {"degraded_weight": current.get(degraded)})
+    proposed_weights = dict(current)
+    proposed_weights[degraded] = float(current[degraded]) - move
+    proposed_weights[replacement] = float(proposed_weights.get(replacement, 0.0)) + move
+    proposed_weights = {key: weight for key, weight in proposed_weights.items() if weight > 1e-12}
+    proposed = set_allocation(
+        config.config,
+        cohort_id=DEFAULT_COHORT_ID,
+        dimension="caller_id",
+        weights=proposed_weights,
+    )
+    dims = changed_dims(config.config, proposed)
+    shift = max_allocation_shift(config.config, proposed)
+    if dims != ["caller_id"] or shift > CALLER_ID_ROTATION_MAX_SHIFT + 1e-6:
+        return CallerIdRotationBuild(
+            None,
+            "rotation_not_isolated",
+            {"changed_dims": dims, "shift": shift},
+        )
+    repl_slice = _cohort_slice(
+        store, workflow.workflow_id, cohort_id=DEFAULT_COHORT_ID, caller_id=replacement
+    )
+    repl_primary, repl_primary_n = _caller_rate(repl_slice, primary)
+    bad_primary_rate, bad_primary_n = _caller_rate(bad, primary)
+    repl_guard, _repl_guard_n = _caller_rate(repl_slice, guard_kpi)
+    dry = dry_run_impact(
+        control_primary=bad_primary_rate,
+        winner_primary=repl_primary,
+        control_guardrail=bad_guard if _rate_ok(bad_guard, bad_guard_n) else None,
+        winner_guardrail=repl_guard,
+        guardrail_max_drop=guard_max_drop,
+        control_n=bad_primary_n,
+        winner_n=repl_primary_n,
+        min_sample=MIN_COHORT_SAMPLE,
+        current_alloc=current,
+        proposed_alloc=proposed_weights,
+    )
+    # Score the traffic that actually moves, not a pretend full swap.
+    arm_lift = float(repl_slice.pickup) - float(bad.pickup)
+    expected = arm_lift * shift
+    score = 0.0
+    if dry.get("sample_ok") and arm_lift > 0:
+        score += min(0.5, expected * 8)
+    if dry.get("sample_ok"):
+        score += 0.25
+    if dry.get("guardrail_ok"):
+        score += 0.2
+    score = max(0.0, min(1.0, score))
+    dry = {
+        **dry,
+        "label": "caller_id_rotation",
+        "limitation": (
+            "Moves a limited share of the default cohort off the degraded caller id. "
+            "Other cohorts, dimensions, prompt, and schedule stay as they are. "
+            "Historical pickup does not prove the next window will recover."
+        ),
+        "rotation_limit": CALLER_ID_ROTATION_MAX_SHIFT,
+        "rotation_limit_reason": (
+            f"At most {CALLER_ID_ROTATION_MAX_SHIFT:.2f} of allocation mass moves in one proposal "
+            "so a later window can measure pickup. A heavier current weight keeps a residual. "
+            "The workflow max_shift still decides auto-apply versus approval."
+        ),
+        "shift": shift,
+        "baseline_pickup": bad.pickup,
+        "candidate_pickup": repl_slice.pickup,
+        "pickup_lift": arm_lift,
+        "expected_pickup_lift": expected,
+        "impact_score": score,
+        "impact_basis": "bounded_default_cohort_pickup_shift",
+    }
+    untouched = [
+        cohort
+        for cohort in (config.config.get("allocations") or {})
+        if str(cohort) != DEFAULT_COHORT_ID
+    ]
+    attempt = next_caller_id_attempt_seq(store, incident.incident_id)
+    pid = proposal_id_for(
+        "caller_id_rotation",
+        incident.incident_id,
+        attempt,
+        config.version,
+        degraded,
+        replacement,
+        json.dumps(proposed_weights, sort_keys=True),
+    )
+    now = _now()
+    affected = store.uploaded_leads(workflow.workflow_id)
+    summary = (
+        f"Rotate {shift:.2f} of {workflow.workflow_id}/{DEFAULT_COHORT_ID} caller_id "
+        f"from {degraded} to {replacement}"
+    )
+    rationale = (
+        f"Caller id {degraded} pickup {float(bad.pickup):.3f} is {drop:.3f} below the default cohort "
+        f"on {bad.dials} dials in that cohort. {replacement} pickup is {float(repl_slice.pickup):.3f} "
+        f"on {repl_slice.dials} dials. Moving {shift:.2f} of the default-cohort allocation "
+        f"(cap {CALLER_ID_ROTATION_MAX_SHIFT:.2f}) leaves the rest of the config in place "
+        "so the next window can show whether pickup recovers."
+    )
+    return CallerIdRotationBuild(
+        ProposalDraft(
+            proposal_id=pid,
+            workflow_id=workflow.workflow_id,
+            base_version=config.version,
+            status="draft",
+            source=CALLER_ID_ROTATION_SOURCE,
+            source_ref=incident.incident_id,
+            changed_dims=dims,
+            proposed_config=proposed,
+            change_summary=summary,
+            diff={
+                "changed_dims": dims,
+                "dimension": "caller_id",
+                "cohort_id": DEFAULT_COHORT_ID,
+                "allocation": allocation_diff(current, proposed_weights),
+                "degraded_caller_id": degraded,
+                "replacement_caller_id": replacement,
+                "rotation_limit": CALLER_ID_ROTATION_MAX_SHIFT,
+                "shift": shift,
+                "targeted": True,
+                "cohorts_left_unchanged": untouched,
+            },
+            dry_run=dry,
+            impact_score=score,
+            affected_leads=int(affected),
+            rationale=rationale,
+            evidence={
+                "incident_id": incident.incident_id,
+                "signal_type": incident.signal_type,
+                "degraded_caller_id": degraded,
+                "replacement_caller_id": replacement,
+                "degraded_pickup": bad.pickup,
+                "degraded_dials": bad.dials,
+                "replacement_pickup": repl_slice.pickup,
+                "replacement_dials": repl_slice.dials,
+                "cohort_id": DEFAULT_COHORT_ID,
+                "cohort_pickup": cohort.pickup,
+                "cohort_dials": cohort.dials,
+                "pickup_drop": drop,
+                "pickup_lift": arm_lift,
+                "primary_kpi": primary,
+                "degraded_primary": bad_primary_rate,
+                "degraded_primary_n": bad_primary_n,
+                "replacement_primary": repl_primary,
+                "replacement_primary_n": repl_primary_n,
+                "guardrail_kpi": guard_kpi,
+                "guardrail_max_drop": guard_max_drop,
+                "rotation_limit": CALLER_ID_ROTATION_MAX_SHIFT,
+                "shift": shift,
+                "attempt": attempt,
+                "targeted": True,
+                "candidates_rejected": [row for row in evaluated if row["reason"] is not None],
+            },
+            created_at=now,
+            updated_at=now,
+        ),
+        None,
+        {"replacement_caller_id": replacement, "shift": shift},
     )
 
 

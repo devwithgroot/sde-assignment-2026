@@ -16,8 +16,13 @@ from controller.api.models import Workflow, WorkflowConfig
 from controller.persistence.repositories import Store
 from controller.services.audit import audit
 from controller.services.change_builder import (
+    ALLOCATION_DIMS,
+    CALLER_ID_ROTATION_SOURCE,
     ProposalDraft,
+    _allocation_weights,
+    _weights_match,
     auto_apply_permitted,
+    build_caller_id_rotation_proposal,
     build_explore_proposal,
     build_rollback_proposal,
     build_winner_proposal,
@@ -127,6 +132,17 @@ def save_snapshot(
     store.upsert_config_snapshot(snap)
 
 
+def _auto_apply_outcome_ambiguous(exc: SimulatorError) -> bool:
+    """True when the PUT may already have been committed.
+
+    A timeout, a dropped connection, or a 5xx can happen after the simulator
+    applied the config. A 4xx is a definite refusal and did not apply.
+    """
+    if 400 <= exc.status < 500:
+        return False
+    return True
+
+
 def submit_proposal(
     client: SimulatorClient,
     store: Store,
@@ -136,7 +152,13 @@ def submit_proposal(
 ) -> ProposalDraft:
     """Persist draft, then route via auto-apply or approval. Idempotent on proposal_id."""
     existing = store.get_proposal(draft.proposal_id)
-    if existing is not None and existing["status"] in {"submitted", "approved", "applied", "auto_applied"}:
+    if existing is not None and existing["status"] in {
+        "submitted",
+        "approved",
+        "applied",
+        "auto_applied",
+        "auto_apply_uncertain",
+    }:
         draft.status = existing["status"]
         draft.approval_id = existing["approval_id"]
         draft.route = existing["route"]
@@ -145,6 +167,13 @@ def submit_proposal(
     ok, problems = auto_apply_permitted(
         workflow, current.config, draft.proposed_config, impact_score=draft.impact_score
     )
+    if ok:
+        # Record the route before the PUT. A crash or a lost response must not
+        # look like an approval draft, and must not be retried as a new id.
+        draft.route = "auto_apply"
+        draft.status = "auto_apply_uncertain"
+        draft.error_code = None
+        draft.error_detail = None
     persist_proposal(store, draft)
     audit(
         store,
@@ -186,7 +215,6 @@ def submit_proposal(
         )
 
     if ok:
-        draft.route = "auto_apply"
         try:
             result = client.auto_apply(
                 draft.workflow_id,
@@ -219,6 +247,13 @@ def submit_proposal(
                 store.update_experiment_promotion(draft.source_ref, "promoted_auto_apply")
             if draft.source_ref and draft.source == "decay_rollback":
                 store.update_experiment_promotion(draft.source_ref, "rolled_back")
+            if draft.source == CALLER_ID_ROTATION_SOURCE:
+                _resolve_matching_caller_rotation(
+                    store,
+                    draft.workflow_id,
+                    draft.proposal_id,
+                    resolution=f"Auto-applied caller-id rotation {draft.proposal_id} → v{new_version}",
+                )
             audit(
                 store,
                 kind="auto_applied",
@@ -233,8 +268,22 @@ def submit_proposal(
         except SimulatorError as exc:
             draft.error_code = exc.code
             draft.error_detail = str(exc.detail)
-            draft.status = "failed" if exc.status not in {403, 409} else "blocked_auto_apply"
             draft.updated_at = _now()
+            if _auto_apply_outcome_ambiguous(exc):
+                draft.status = "auto_apply_uncertain"
+                draft.route = "auto_apply"
+                persist_proposal(store, draft)
+                audit(
+                    store,
+                    kind="auto_apply_uncertain",
+                    summary=f"Auto-apply outcome unknown for {draft.proposal_id}: {exc.code}",
+                    details={"status": exc.status, "detail": exc.detail},
+                    workflow_id=draft.workflow_id,
+                    related_proposal_id=draft.proposal_id,
+                    idempotency_parts=[draft.proposal_id, "auto_apply_uncertain", exc.code],
+                )
+                return draft
+            draft.status = "failed" if exc.status not in {403, 409} else "blocked_auto_apply"
             persist_proposal(store, draft)
             # Fall through to approval route when auto-apply is denied.
             if exc.status not in {403, 409}:
@@ -700,7 +749,14 @@ def apply_approved(client: SimulatorClient, store: Store) -> list[dict[str, Any]
                 store.update_experiment_promotion(prop["source_ref"], "promoted")
             if prop["source"] == "decay_rollback" and prop["source_ref"]:
                 store.update_experiment_promotion(prop["source_ref"], "rolled_back")
-            if prop["source"] in {
+            if prop["source"] == CALLER_ID_ROTATION_SOURCE:
+                _resolve_matching_caller_rotation(
+                    store,
+                    row["workflow_id"],
+                    row["proposal_id"],
+                    resolution=f"Applied approval {row['approval_id']} → v{result.get('version')}",
+                )
+            elif prop["source"] in {
                 "experiment_winner",
                 "experiment_explore",
                 "decay_rollback",
@@ -965,6 +1021,451 @@ def propose_decay_rollbacks(
     return out
 
 
+_ACTIVE_CALLER_ROTATION = frozenset({"submitted", "approved"})
+
+
+def _resolve_matching_caller_rotation(
+    store: Store,
+    workflow_id: str,
+    proposal_id: str,
+    *,
+    resolution: str,
+) -> None:
+    """Close only the incident linked to this rotation. Other open incidents stay open."""
+    for incident in find_open_incidents_for_workflow(store, workflow_id):
+        if incident.related_proposal_id == proposal_id:
+            resolve_incident(store, incident.incident_id, resolution=resolution)
+
+
+def _caller_rotation_rows(store: Store, incident_id: str) -> list[Any]:
+    return [
+        prop
+        for prop in store.list_proposals()
+        if prop["source"] == CALLER_ID_ROTATION_SOURCE and prop["source_ref"] == incident_id
+    ]
+
+
+def _workflow_has_active_caller_rotation(store: Store, workflow_id: str) -> bool:
+    return any(
+        prop["source"] == CALLER_ID_ROTATION_SOURCE and prop["status"] in _ACTIVE_CALLER_ROTATION
+        for prop in store.list_proposals(workflow_id)
+    )
+
+
+def _skip_caller_rotation(
+    store: Store,
+    workflow: Workflow,
+    incident_id: str,
+    reason: str,
+    details: dict[str, Any] | None = None,
+) -> None:
+    audit(
+        store,
+        kind="caller_id_rotation_skipped",
+        summary=f"Skipped caller-id rotation for {incident_id}: {reason}",
+        details={"reason": reason, **(details or {})},
+        workflow_id=workflow.workflow_id,
+        tenant_id=workflow.tenant_id,
+        related_incident_id=incident_id,
+        idempotency_parts=[incident_id, reason],
+    )
+
+
+def _release_stale_caller_draft(store: Store, prop, live: WorkflowConfig) -> None:
+    outdated = _draft_from_stored_proposal(prop)
+    outdated.status = "stale"
+    outdated.error_code = "stale_base_version"
+    outdated.error_detail = (
+        f"draft base_version={prop['base_version']} live={live.version}; proposal was not on the simulator"
+    )
+    outdated.updated_at = _now()
+    persist_proposal(store, outdated)
+
+
+def _configs_match(proposed: dict[str, Any], live: dict[str, Any]) -> bool:
+    """Full-config equality using the same fields and weight normalisation as diffs.
+
+    Allocation cells are compared after dropping non-positive weights and
+    renormalising, within the same tolerance used for rollback conflict checks.
+    Prompt, cohorts, and schedule stay exact.
+    """
+    if proposed.get("prompt_version") != live.get("prompt_version"):
+        return False
+    if json.dumps(proposed.get("cohorts") or [], sort_keys=True) != json.dumps(
+        live.get("cohorts") or [], sort_keys=True
+    ):
+        return False
+    if json.dumps(proposed.get("schedule") or {}, sort_keys=True) != json.dumps(
+        live.get("schedule") or {}, sort_keys=True
+    ):
+        return False
+    proposed_alloc = proposed.get("allocations") or {}
+    live_alloc = live.get("allocations") or {}
+    if not isinstance(proposed_alloc, dict) or not isinstance(live_alloc, dict):
+        return False
+    if set(proposed_alloc) != set(live_alloc):
+        return False
+    for cohort in proposed_alloc:
+        for dim in ALLOCATION_DIMS:
+            if not _weights_match(
+                _allocation_weights(proposed, str(cohort), dim),
+                _allocation_weights(live, str(cohort), dim),
+            ):
+                return False
+    return True
+
+
+def _auto_apply_is_proven(live: WorkflowConfig, prop) -> bool:
+    """True only when this row was sent through auto-apply and the live config is that proposal.
+
+    A newer version, or a matching caller-id cell, is not enough. An approval
+    draft is never treated as auto-applied.
+    """
+    if prop["route"] != "auto_apply":
+        return False
+    try:
+        if int(live.version) <= int(prop["base_version"]):
+            return False
+    except (TypeError, ValueError):
+        return False
+    try:
+        proposed = json.loads(prop["proposed_config_json"])
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if not isinstance(proposed, dict):
+        return False
+    return _configs_match(proposed, live.config)
+
+
+def _snapshot_recovered_caller_apply(
+    store: Store,
+    workflow: Workflow,
+    proposal_id: str,
+    version: int,
+    config: dict[str, Any],
+) -> None:
+    save_snapshot(
+        store,
+        workflow_id=workflow.workflow_id,
+        version=int(version),
+        config=config,
+        source="post_apply",
+        related_proposal_id=proposal_id,
+    )
+
+
+def _finish_recovered_remote_apply(
+    store: Store,
+    workflow: Workflow,
+    prop,
+    approval: ControllerApproval,
+    live: WorkflowConfig,
+) -> None:
+    """A remote approval already applied; finish the local proposal and its incident."""
+    version = approval.applied_version
+    if version is None and int(live.version) > int(prop["base_version"]):
+        version = int(live.version)
+    proposed = json.loads(prop["proposed_config_json"])
+    if version is not None and isinstance(proposed, dict):
+        _snapshot_recovered_caller_apply(
+            store, workflow, str(prop["proposal_id"]), int(version), proposed
+        )
+    _resolve_matching_caller_rotation(
+        store,
+        workflow.workflow_id,
+        str(prop["proposal_id"]),
+        resolution=f"Recovered applied approval {approval.approval_id} → v{version}",
+    )
+
+
+def _record_recovered_auto_apply(
+    store: Store,
+    workflow: Workflow,
+    prop,
+    live: WorkflowConfig,
+) -> ProposalDraft:
+    """The simulator already has this draft's rotation; record it without shifting again."""
+    draft = _draft_from_stored_proposal(prop)
+    draft.status = "auto_applied"
+    draft.route = "auto_apply"
+    draft.error_code = None
+    draft.error_detail = None
+    draft.submitted_at = draft.submitted_at or _now()
+    draft.updated_at = _now()
+    persist_proposal(store, draft)
+    _snapshot_recovered_caller_apply(
+        store, workflow, draft.proposal_id, int(live.version), live.config
+    )
+    _resolve_matching_caller_rotation(
+        store,
+        workflow.workflow_id,
+        draft.proposal_id,
+        resolution=f"Recovered auto-applied caller-id rotation {draft.proposal_id} → v{live.version}",
+    )
+    audit(
+        store,
+        kind="caller_id_auto_apply_recovered",
+        summary=(
+            f"Recovered auto-applied caller-id rotation {draft.proposal_id} "
+            f"already on v{live.version}"
+        ),
+        details={"version": int(live.version), "base_version": prop["base_version"]},
+        workflow_id=workflow.workflow_id,
+        tenant_id=workflow.tenant_id,
+        related_proposal_id=draft.proposal_id,
+        related_incident_id=prop["source_ref"],
+        idempotency_parts=[draft.proposal_id, "auto_apply_recovered", int(live.version)],
+    )
+    return draft
+
+
+def _sync_remote_caller_proposal(
+    store: Store,
+    workflow: Workflow,
+    prop,
+    remote: list[dict[str, Any]],
+    live: WorkflowConfig,
+) -> ProposalDraft | None:
+    matches = [row for row in remote if row.get("proposal_id") == prop["proposal_id"]]
+    if not matches:
+        return None
+    approval = _approval_from_api(matches[0], proposal_id=str(prop["proposal_id"]))
+    store.upsert_controller_approval(approval)
+    _sync_proposal_status_from_approval(store, approval)
+    if approval.status == "applied":
+        _finish_recovered_remote_apply(store, workflow, prop, approval, live)
+    stored = store.get_proposal(prop["proposal_id"])
+    if stored is None:
+        return None
+    audit(
+        store,
+        kind="caller_id_rotation_resumed",
+        summary=f"Resumed caller-id proposal {prop['proposal_id']} from simulator status {approval.status}",
+        details={"approval_id": approval.approval_id, "status": approval.status},
+        workflow_id=workflow.workflow_id,
+        tenant_id=workflow.tenant_id,
+        related_proposal_id=str(prop["proposal_id"]),
+        related_approval_id=approval.approval_id,
+        related_incident_id=prop["source_ref"],
+        idempotency_parts=[prop["proposal_id"], approval.approval_id, "resumed"],
+    )
+    return _draft_from_stored_proposal(stored)
+
+
+def _recover_stranded_caller_drafts(
+    client: SimulatorClient,
+    store: Store,
+    workflow: Workflow,
+    live: WorkflowConfig,
+    drafts: list[Any],
+    unconfirmed: list[Any] | None = None,
+) -> tuple[str, list[ProposalDraft], str | None]:
+    """Resume a local draft or an uncertain submission, or resubmit the same id.
+
+    Outcome is "resumed" when an in-flight or already-applied proposal exists,
+    "rejected" when the simulator already rejected that id, "unconfirmed" when a
+    submission is still missing remotely and must not be replaced, "released"
+    when a draft was stale and a fresh id may be built, or "lookup_failed" when
+    the remote list could not be read.
+    """
+    try:
+        remote = client.list_approvals(workflow_id=workflow.workflow_id)
+    except SimulatorError as exc:
+        return "lookup_failed", [], exc.code
+    resumed: list[ProposalDraft] = []
+    for prop in unconfirmed or []:
+        synced = _sync_remote_caller_proposal(store, workflow, prop, remote, live)
+        if synced is None:
+            audit(
+                store,
+                kind="caller_id_rotation_unconfirmed",
+                summary=(
+                    f"Caller-id proposal {prop['proposal_id']} was submitted but is "
+                    "not on the simulator yet"
+                ),
+                details={"proposal_id": prop["proposal_id"], "status": "submitted_unconfirmed"},
+                workflow_id=workflow.workflow_id,
+                tenant_id=workflow.tenant_id,
+                related_proposal_id=str(prop["proposal_id"]),
+                related_incident_id=prop["source_ref"],
+                idempotency_parts=[prop["proposal_id"], "unconfirmed"],
+            )
+            return "unconfirmed", resumed, None
+        resumed.append(synced)
+    if any(draft.status == "rejected" for draft in resumed):
+        return "rejected", resumed, None
+    if any(draft.status in {"submitted", "approved", "applied", "auto_applied"} for draft in resumed):
+        return "resumed", resumed, None
+    for prop in drafts:
+        synced = _sync_remote_caller_proposal(store, workflow, prop, remote, live)
+        if synced is not None:
+            resumed.append(synced)
+            continue
+        if int(prop["base_version"]) != int(live.version):
+            _release_stale_caller_draft(store, prop, live)
+            continue
+        submitted = submit_proposal(client, store, workflow, live, _draft_from_stored_proposal(prop))
+        resumed.append(submitted)
+    if any(draft.status == "rejected" for draft in resumed):
+        return "rejected", resumed, None
+    if any(draft.status in {"submitted", "approved", "applied", "auto_applied"} for draft in resumed):
+        return "resumed", resumed, None
+    return "released", [], None
+
+
+def propose_caller_id_rotations(
+    client: SimulatorClient,
+    store: Store,
+    workflows: list[Workflow],
+    configs: list[WorkflowConfig],
+) -> list[ProposalDraft]:
+    """One governed rotation per workflow for an open caller_id_health incident.
+
+    A pending proposal is left alone. A local draft is resumed from the simulator
+    when that proposal id was already accepted. An approval that is already
+    applied finishes the local proposal and only the linked incident. An
+    auto-apply whose outcome is still unknown is reconciled against the live
+    config and is not retried or replaced. It is recorded as applied only when
+    that row went through the auto-apply route, the live version moved past the
+    proposal base, and the full live config is the proposed config. An uncertain
+    submission is looked up before any new id is created. Human rejection is
+    not retried. A stale, lapsed, or expired proposal is rebuilt from the live
+    config with a new id. The passed configs are not a substitute for a failed
+    live config read.
+    """
+    del configs  # Live config must come from the simulator on this path.
+    out: list[ProposalDraft] = []
+    for workflow in workflows:
+        incidents = [
+            incident
+            for incident in find_open_incidents_for_workflow(store, workflow.workflow_id)
+            if incident.signal_type == "caller_id_health"
+        ]
+        if not incidents:
+            continue
+        if _workflow_has_active_caller_rotation(store, workflow.workflow_id):
+            continue
+
+        def _incident_sort(incident: Any) -> tuple[bool, float, str]:
+            raw = incident.evidence.get("recent_value") if isinstance(incident.evidence, dict) else None
+            try:
+                value = float(raw) if raw is not None else 0.0
+            except (TypeError, ValueError):
+                value = 0.0
+            return (raw is None, value, incident.incident_id)
+
+        incidents.sort(key=_incident_sort)
+        try:
+            live = client.workflow_config(workflow.workflow_id)
+        except SimulatorError as exc:
+            for incident in incidents:
+                _skip_caller_rotation(
+                    store,
+                    workflow,
+                    incident.incident_id,
+                    "live_config_unavailable",
+                    {"code": exc.code, "endpoint": exc.endpoint},
+                )
+            continue
+        for incident in incidents:
+            rows = _caller_rotation_rows(store, incident.incident_id)
+            if any(prop["status"] == "rejected" for prop in rows):
+                _skip_caller_rotation(store, workflow, incident.incident_id, "human_rejected")
+                continue
+            settled = [prop for prop in rows if prop["status"] in {"applied", "auto_applied"}]
+            if settled:
+                for prop in settled:
+                    _resolve_matching_caller_rotation(
+                        store,
+                        workflow.workflow_id,
+                        str(prop["proposal_id"]),
+                        resolution=(
+                            f"Recovered caller-id rotation {prop['proposal_id']} "
+                            f"already {prop['status']}"
+                        ),
+                    )
+                break
+            ok_attn, attn_reason = _approver_attention_ok(store, workflow)
+            if not ok_attn:
+                from controller.services.fairness import ACTION_GOVERNANCE, FairScheduler
+
+                FairScheduler(store).record_deferral(
+                    workflow_id=workflow.workflow_id,
+                    tenant_id=workflow.tenant_id,
+                    action_kind=ACTION_GOVERNANCE,
+                    priority=8,
+                    reason=attn_reason,
+                )
+                break
+            uncertain = [prop for prop in rows if prop["status"] == "auto_apply_uncertain"]
+            if uncertain:
+                proven = [prop for prop in uncertain if _auto_apply_is_proven(live, prop)]
+                if proven:
+                    out.extend(
+                        _record_recovered_auto_apply(store, workflow, prop, live) for prop in proven
+                    )
+                    break
+                for prop in uncertain:
+                    audit(
+                        store,
+                        kind="caller_id_auto_apply_uncertain",
+                        summary=(
+                            f"Caller-id auto-apply {prop['proposal_id']} is not confirmed "
+                            "on the live config"
+                        ),
+                        details={
+                            "base_version": prop["base_version"],
+                            "live_version": live.version,
+                            "route": prop["route"],
+                        },
+                        workflow_id=workflow.workflow_id,
+                        tenant_id=workflow.tenant_id,
+                        related_proposal_id=str(prop["proposal_id"]),
+                        related_incident_id=prop["source_ref"],
+                        idempotency_parts=[prop["proposal_id"], "auto_apply_unreconciled"],
+                    )
+                break
+            drafts = [prop for prop in rows if prop["status"] == "draft"]
+            unconfirmed = [prop for prop in rows if prop["status"] == "submitted_unconfirmed"]
+            if drafts or unconfirmed:
+                outcome, recovered, lookup_code = _recover_stranded_caller_drafts(
+                    client, store, workflow, live, drafts, unconfirmed
+                )
+                if outcome == "lookup_failed":
+                    _skip_caller_rotation(
+                        store,
+                        workflow,
+                        incident.incident_id,
+                        "remote_approval_lookup_failed",
+                        {"code": lookup_code},
+                    )
+                    break
+                if outcome == "rejected":
+                    _skip_caller_rotation(store, workflow, incident.incident_id, "human_rejected")
+                    continue
+                if outcome == "unconfirmed":
+                    break
+                if outcome == "resumed":
+                    out.extend(recovered)
+                    break
+            built = build_caller_id_rotation_proposal(store, workflow, live, incident)
+            if built.draft is None:
+                _skip_caller_rotation(
+                    store,
+                    workflow,
+                    incident.incident_id,
+                    built.reason or "skipped",
+                    built.details,
+                )
+                continue
+            mark_incident_mitigating(store, incident.incident_id, built.draft.proposal_id)
+            submitted = submit_proposal(client, store, workflow, live, built.draft)
+            out.append(submitted)
+            # One allocation change per cycle. A second incident waits until this one settles.
+            break
+    return out
+
+
 def run_governance_cycle(
     client: SimulatorClient,
     store: Store,
@@ -1001,6 +1502,15 @@ def run_governance_cycle(
 
     rollbacks = propose_decay_rollbacks(client, store, workflows, configs, decay_hits or [])
     report.rollbacks_proposed = len(rollbacks)
+
+    rotations = propose_caller_id_rotations(client, store, workflows, configs)
+    report.proposals_built += len(rotations)
+    report.proposals_submitted += sum(
+        1 for prop in rotations if prop.status in {"submitted", "approved", "auto_applied", "applied"}
+    )
+    report.auto_applied += sum(1 for prop in rotations if prop.status == "auto_applied")
+    if rotations:
+        report.notes.append(f"caller_id_rotations={len(rotations)}")
 
     # Second reconcile/apply pass for anything that became approved mid-cycle (rare without advance).
     reconcile_approvals(client, store)
