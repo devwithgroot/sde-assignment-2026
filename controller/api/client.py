@@ -33,11 +33,13 @@ class SimulatorClient:
         *,
         timeout_seconds: float = 30.0,
         max_retries: int = 2,
+        chunk_timeout_seconds: float | None = None,
         transport: httpx.BaseTransport | None = None,
         sleeper: Callable[[float], None] | None = None,
         rng: random.Random | None = None,
     ):
         self._max_retries = max_retries
+        self._chunk_timeout = chunk_timeout_seconds if chunk_timeout_seconds is not None else timeout_seconds
         self._sleeper = sleeper or time.sleep
         self._rng = rng or random.Random()
         self._http = httpx.Client(
@@ -81,6 +83,12 @@ class SimulatorClient:
             )
         return [ChunkMeta.model_validate(item) for item in payload]
 
+    def chunk_text(self, n: int) -> str:
+        """NDJSON body of one chunk. Does not open the path field from the metadata."""
+        path = f"/events/chunks/{n}"
+        response = self._request(path, timeout=self._chunk_timeout)
+        return response.text
+
     def _get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
         response = self._request(path, params=params)
         try:
@@ -90,11 +98,16 @@ class SimulatorClient:
                 status=response.status_code, code="bad_json", detail=str(exc), endpoint=path, body=response.text
             ) from exc
 
-    def _request(self, path: str, params: dict[str, Any] | None = None) -> httpx.Response:
+    def _request(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> httpx.Response:
         last_transport: httpx.TransportError | None = None
         for attempt in range(self._max_retries + 1):
             try:
-                response = self._http.get(path, params=params)
+                response = self._http.get(path, params=params, timeout=timeout)
             except httpx.TransportError as exc:
                 last_transport = exc
                 if attempt >= self._max_retries:

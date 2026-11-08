@@ -103,3 +103,7 @@ docs: record phase 0 simulator verification
 ## Phase 1
 
 The Phase 1 record is `docs/IMPLEMENTATION_STATUS_PHASE1.md`.
+
+## Phase 2
+
+The Phase 2 record is `docs/IMPLEMENTATION_STATUS_PHASE2.md`. Phase 3 has not started.

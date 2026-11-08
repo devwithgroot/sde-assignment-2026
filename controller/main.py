@@ -14,6 +14,8 @@ from dataclasses import dataclass
 
 from controller.api.client import SimulatorClient, SimulatorError
 from controller.api.models import ChunkMeta, SimState, Workflow, WorkflowConfig
+from controller.persistence.repositories import IngestIntegrityError, Store
+from controller.services.ingestion import ingest_available
 from controller.settings import Settings
 
 log = logging.getLogger("controller")
@@ -98,13 +100,14 @@ def observe(client: SimulatorClient) -> Observation:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Observe the simulator without changing it.")
     parser.add_argument("--url", default=None, help="Simulator base URL. Falls back to SIM_URL.")
+    parser.add_argument("--db", default=None, help="SQLite path. Falls back to CONTROLLER_DB or data/controller.sqlite.")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        settings = Settings.from_env(args.url)
+        settings = Settings.from_env(args.url, db_path=args.db)
     except ValueError as exc:
         print(f"usage: python -m controller.main --url <SIM_URL>\n{exc}", file=sys.stderr)
         return 2
@@ -113,17 +116,31 @@ def main(argv: list[str] | None = None) -> int:
         with SimulatorClient(
             settings.sim_url,
             timeout_seconds=settings.timeout_seconds,
+            chunk_timeout_seconds=settings.chunk_timeout_seconds,
             max_retries=settings.max_retries,
         ) as client:
             report = observe(client)
-    except SimulatorError as exc:
-        log.error(_line("simulator_error", endpoint=exc.endpoint, status=exc.status, code=exc.code, detail=exc.detail))
+            store = Store(settings.db_path)
+            try:
+                ingested = ingest_available(client, store)
+            finally:
+                store.close()
+    except (SimulatorError, IngestIntegrityError) as exc:
+        if isinstance(exc, SimulatorError):
+            log.error(_line("simulator_error", endpoint=exc.endpoint, status=exc.status, code=exc.code, detail=exc.detail))
+        else:
+            log.error(_line("ingest_error", chunk=exc.chunk, detail=exc.detail))
         return 1
     print(
         f"observe scenario={report.state.scenario} minute={report.state.sim_minute} "
         f"finished={str(report.state.finished).lower()} workflows={len(report.workflows)} "
         f"history_chunks={len(report.history_chunks)} event_chunks={len(report.event_chunks)}"
     )
+    for item in ingested:
+        print(
+            f"ingest kind={item.kind} fetched={item.chunks_fetched} committed={item.chunks_committed} "
+            f"inserted={item.inserted} duplicates={item.duplicates} issues={item.issues}"
+        )
     for workflow, config in zip(report.workflows, report.configs, strict=True):
         print(
             f"  {workflow.workflow_id} version={config.version} primary={workflow.objective.primary} "
