@@ -38,6 +38,7 @@ STICKY_PROMOTION_STATUSES = frozenset(
         "decay_detected",
         "rolled_back",
         "exploration_submitted",
+        "promotion_rejected",
     }
 )
 # Statuses that planning/evaluation may assign. They must not replace a sticky status.
@@ -567,8 +568,8 @@ def evaluate_experiment(state: ExperimentState) -> ExperimentState:
             f"{winner_arm.variant} beats control {state.control_variant} on {state.primary_kpi}: "
             f"{winner_arm.reason}"
         )
-        # Do not downgrade a promotion, in-flight proposal, or decay mark just because
-        # this cycle still sees a statistical winner. Rejected/expired can be re-queued.
+        # Do not downgrade a sticky promotion status (incl. human rejection) just because
+        # this cycle still sees a statistical winner. Stale/lapsed/expired stay retryable.
         if state.promotion_status not in STICKY_PROMOTION_STATUSES:
             state.promotion_status = "ready_to_propose_observe_only"
         state.evidence = {

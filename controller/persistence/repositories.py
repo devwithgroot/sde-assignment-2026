@@ -589,7 +589,8 @@ class Store:
                  promotion_status = CASE
                    WHEN experiments.promotion_status IN (
                           'promoted', 'promoted_auto_apply', 'proposal_submitted',
-                          'decay_detected', 'rolled_back', 'exploration_submitted'
+                          'decay_detected', 'rolled_back', 'exploration_submitted',
+                          'promotion_rejected'
                         )
                     AND excluded.promotion_status IN (
                           'observe_only_not_promoted', 'ready_to_propose_observe_only'

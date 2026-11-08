@@ -329,7 +329,8 @@ def test_replanning_preserves_promoted_status(tmp_path):
     store.close()
 
 
-def test_rejected_promotion_can_be_proposed_again(tmp_path):
+def test_rejected_promotion_survives_replan(tmp_path):
+    """Human rejection is sticky — replan must not reopen automatic promotion."""
     store = Store(tmp_path / "rejected.sqlite")
     wf, cfg = _workflow(), _v1_config()
     _seed_winner(store)
@@ -338,7 +339,8 @@ def test_rejected_promotion_can_be_proposed_again(tmp_path):
 
     again = run_workflow_experiments(store, wf, cfg, min_sample=100)
     assert again[0].status == "winner"
-    assert again[0].promotion_status == "ready_to_propose_observe_only"
+    assert again[0].promotion_status == "promotion_rejected"
+    assert store.get_experiment(first[0].experiment_id)["promotion_status"] == "promotion_rejected"
     store.close()
 
 

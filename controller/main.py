@@ -22,7 +22,7 @@ from controller.services.decay import detect_promoted_decay
 from controller.services.detector import detect_all
 from controller.services.experiments import run_all_experiments
 from controller.services.fairness import ACTION_GOVERNANCE, ACTION_PROMPT_INCIDENT, FairScheduler
-from controller.services.governance import GovernanceReport, run_governance_cycle
+from controller.services.governance import GovernanceReport, next_advance_minutes, run_governance_cycle
 from controller.services.incidents import link_incident_experiment, sync_incidents_from_signals
 from controller.services.ingestion import ingest_available
 from controller.services.joiner import WorkflowConfigRef, project_events
@@ -386,12 +386,15 @@ def main(argv: list[str] | None = None) -> int:
                     log.info(_line("controller_done", cycles=cycles, reason="once_or_already_finished"))
                 else:
                     while True:
-                        adv = client.advance(settings.advance_minutes)
+                        # While approvals are pending/approved, tick 15m so apply_by windows are not skipped.
+                        minutes = next_advance_minutes(store, settings.advance_minutes)
+                        adv = client.advance(minutes)
                         finished = bool(adv.get("finished"))
                         log.info(
                             _line(
                                 "advance",
-                                minutes=settings.advance_minutes,
+                                minutes=minutes,
+                                configured_minutes=settings.advance_minutes,
                                 sim_minute=adv.get("sim_minute"),
                                 ts=adv.get("ts"),
                                 finished=finished,

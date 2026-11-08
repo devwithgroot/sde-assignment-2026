@@ -62,6 +62,18 @@ def proposal_id_for(*parts: object) -> str:
     return f"prop_{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:20]}"
 
 
+def next_winner_attempt_seq(store: Store, experiment_id: str) -> int:
+    """1-based retry sequence from persisted winner proposals for this experiment.
+
+    Stable across restart for the same next attempt: count existing rows, then +1.
+    """
+    n = 0
+    for row in store.list_proposals():
+        if row["source"] == "experiment_winner" and row["source_ref"] == experiment_id:
+            n += 1
+    return n + 1
+
+
 def changed_dims(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
     dims: list[str] = []
     if before.get("prompt_version") != after.get("prompt_version"):
@@ -293,12 +305,16 @@ def build_winner_proposal(
         f"Experiment {experiment.experiment_id} selected {experiment.winner_variant} over "
         f"{experiment.control_variant} on {experiment.primary_kpi}. {experiment.decision_reason}"
     )
+    # Attempt sequence from persisted history keeps retries unique even when base_version is unchanged,
+    # while remaining stable across a crash/restart for the same next attempt.
+    attempt_seq = next_winner_attempt_seq(store, experiment.experiment_id)
     pid = proposal_id_for(
         "winner",
         experiment.experiment_id,
         experiment.winner_variant,
         config.version,
         json.dumps(weights, sort_keys=True),
+        f"attempt_{attempt_seq}",
     )
     now = _now()
     return ProposalDraft(
@@ -311,7 +327,7 @@ def build_winner_proposal(
         changed_dims=dims,
         proposed_config=proposed,
         change_summary=summary,
-        diff=diff,
+        diff={**diff, "attempt_seq": attempt_seq},
         dry_run=dry,
         impact_score=float(dry.get("impact_score") or 0.0),
         affected_leads=int(affected),

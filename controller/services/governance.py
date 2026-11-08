@@ -275,6 +275,33 @@ def submit_proposal(
             ]
             if matches:
                 payload = matches[0]
+                prior_status = str(payload.get("status") or "")
+                # An old lapsed/expired/rejected/applied approval must not be recorded as a
+                # freshly submitted active approval for a retry that reused an ID.
+                if prior_status in {"lapsed", "expired", "rejected", "applied", "stale"}:
+                    approval = _approval_from_api(payload, proposal_id=draft.proposal_id)
+                    store.upsert_controller_approval(approval)
+                    _sync_proposal_status_from_approval(store, approval)
+                    draft.approval_id = approval.approval_id
+                    draft.status = prior_status if prior_status != "applied" else "applied"
+                    draft.error_code = "duplicate_terminal_approval"
+                    draft.error_detail = f"duplicate_proposal_id matched terminal status={prior_status}"
+                    draft.updated_at = _now()
+                    persist_proposal(store, draft)
+                    audit(
+                        store,
+                        kind="approval_duplicate_terminal",
+                        summary=(
+                            f"Duplicate proposal_id {draft.proposal_id} matched "
+                            f"terminal approval {approval.approval_id} ({prior_status})"
+                        ),
+                        details={"status": prior_status},
+                        workflow_id=draft.workflow_id,
+                        related_proposal_id=draft.proposal_id,
+                        related_approval_id=approval.approval_id,
+                        idempotency_parts=[draft.proposal_id, approval.approval_id, prior_status],
+                    )
+                    return draft
             else:
                 draft.status = "submitted_unconfirmed"
                 draft.error_code = exc.code
@@ -338,7 +365,7 @@ def reconcile_approvals(client: SimulatorClient, store: Store) -> list[Controlle
     updated: list[ControllerApproval] = []
     local_rows = store.list_controller_approvals()
     for row in local_rows:
-        if row["status"] in {"applied", "rejected", "expired", "lapsed"}:
+        if row["status"] in TERMINAL_APPROVAL_STATUSES:
             continue
         try:
             payload = client.get_approval(row["approval_id"])
@@ -409,6 +436,69 @@ def reconcile_approvals(client: SimulatorClient, store: Store) -> list[Controlle
     return updated
 
 
+TERMINAL_APPROVAL_STATUSES = frozenset(
+    {"applied", "rejected", "expired", "lapsed", "stale"}
+)
+
+
+def next_advance_minutes(store: Store, configured: int) -> int:
+    """Cap advance at 15 minutes while approvals are pending or approved awaiting apply.
+
+    Never increases the configured interval: a 5-minute setting stays 5.
+    """
+    pending = store.list_controller_approvals(status="pending")
+    approved = store.list_controller_approvals(status="approved")
+    if pending or approved:
+        return min(configured, 15)
+    return configured
+
+
+def _proposal_draft_from_row(
+    prop,
+    *,
+    status: str | None = None,
+    approval_id: str | None = None,
+    error_code: str | None = None,
+    error_detail: str | None = None,
+) -> ProposalDraft:
+    return ProposalDraft(
+        proposal_id=prop["proposal_id"],
+        workflow_id=prop["workflow_id"],
+        base_version=prop["base_version"],
+        status=status if status is not None else prop["status"],
+        source=prop["source"],
+        source_ref=prop["source_ref"],
+        changed_dims=json.loads(prop["changed_dims_json"]),
+        proposed_config=json.loads(prop["proposed_config_json"]),
+        change_summary=prop["change_summary"],
+        diff=json.loads(prop["diff_json"]),
+        dry_run=json.loads(prop["dry_run_json"]),
+        impact_score=prop["impact_score"],
+        affected_leads=prop["affected_leads"],
+        rationale=prop["rationale"],
+        evidence=json.loads(prop["evidence_json"]) if prop["evidence_json"] else {},
+        approval_id=approval_id if approval_id is not None else prop["approval_id"],
+        route=prop["route"],
+        error_code=error_code if error_code is not None else prop["error_code"],
+        error_detail=error_detail if error_detail is not None else prop["error_detail"],
+        created_at=prop["created_at"],
+        updated_at=_now(),
+        submitted_at=prop["submitted_at"],
+    )
+
+
+def _mark_experiment_retryable(store: Store, prop, *, status: str) -> None:
+    if prop["source"] == "experiment_winner" and prop["source_ref"]:
+        store.update_experiment_promotion(prop["source_ref"], status)
+
+
+def _sync_prompt_attempt_for_proposal(store: Store, proposal_id: str, proposal_status: str) -> None:
+    """Release blocking LLM attempts when their related proposal becomes terminal."""
+    from controller.services.prompt_incident import sync_attempt_with_proposal_status
+
+    sync_attempt_with_proposal_status(store, proposal_id, proposal_status)
+
+
 def _sync_proposal_status_from_approval(store: Store, approval: ControllerApproval) -> None:
     prop = store.get_proposal(approval.proposal_id)
     if prop is None:
@@ -423,45 +513,89 @@ def _sync_proposal_status_from_approval(store: Store, approval: ControllerApprov
         "expired": "expired",
         "lapsed": "lapsed",
         "applied": "applied",
+        "stale": "stale",
     }
     new_status = mapping.get(approval.status)
     if not new_status:
         return
-    draft = ProposalDraft(
-        proposal_id=prop["proposal_id"],
-        workflow_id=prop["workflow_id"],
-        base_version=prop["base_version"],
-        status=new_status,
-        source=prop["source"],
-        source_ref=prop["source_ref"],
-        changed_dims=json.loads(prop["changed_dims_json"]),
-        proposed_config=json.loads(prop["proposed_config_json"]),
-        change_summary=prop["change_summary"],
-        diff=json.loads(prop["diff_json"]),
-        dry_run=json.loads(prop["dry_run_json"]),
-        impact_score=prop["impact_score"],
-        affected_leads=prop["affected_leads"],
-        rationale=prop["rationale"],
-        evidence=json.loads(prop["evidence_json"]) if prop["evidence_json"] else {},
-        approval_id=approval.approval_id,
-        route=prop["route"],
-        error_code=prop["error_code"],
-        error_detail=prop["error_detail"],
-        created_at=prop["created_at"],
-        updated_at=_now(),
-        submitted_at=prop["submitted_at"],
-    )
+    draft = _proposal_draft_from_row(prop, status=new_status, approval_id=approval.approval_id)
     persist_proposal(store, draft)
-    if new_status == "rejected" and draft.source_ref and draft.source == "experiment_winner":
-        store.update_experiment_promotion(draft.source_ref, "promotion_rejected")
-    if new_status == "expired" and draft.source_ref and draft.source == "experiment_winner":
-        store.update_experiment_promotion(draft.source_ref, "promotion_expired")
+    if draft.source == "experiment_winner" and draft.source_ref:
+        if new_status == "rejected":
+            store.update_experiment_promotion(draft.source_ref, "promotion_rejected")
+        elif new_status == "expired":
+            store.update_experiment_promotion(draft.source_ref, "promotion_expired")
+        elif new_status == "lapsed":
+            store.update_experiment_promotion(draft.source_ref, "promotion_lapsed")
+        elif new_status == "stale":
+            store.update_experiment_promotion(draft.source_ref, "promotion_stale")
+    if new_status in {"stale", "lapsed", "expired", "rejected"}:
+        _sync_prompt_attempt_for_proposal(store, draft.proposal_id, new_status)
+
+
+def _mark_approval_terminal(
+    store: Store,
+    row,
+    *,
+    status: str,
+    error_code: str | None = None,
+    error_detail: str | None = None,
+    raw: dict[str, Any] | None = None,
+) -> ControllerApproval:
+    approval = ControllerApproval(
+        approval_id=row["approval_id"],
+        proposal_id=row["proposal_id"],
+        workflow_id=row["workflow_id"],
+        status=status,
+        base_version=row["base_version"],
+        changed_dims=json.loads(row["changed_dims_json"]) if row["changed_dims_json"] else [],
+        created_at=row["created_at"],
+        updated_at=_now(),
+        expires_at=row["expires_at"],
+        apply_by=row["apply_by"],
+        decided_at=row["decided_at"],
+        reasons=json.loads(row["reasons_json"]) if row["reasons_json"] else None,
+        applied_version=row["applied_version"],
+        last_reconciled_at=_now(),
+        raw=raw,
+    )
+    store.upsert_controller_approval(approval)
+    prop = store.get_proposal(row["proposal_id"])
+    if prop is not None:
+        draft = _proposal_draft_from_row(
+            prop,
+            status=status,
+            approval_id=row["approval_id"],
+            error_code=error_code,
+            error_detail=error_detail,
+        )
+        persist_proposal(store, draft)
+        if status == "stale":
+            _mark_experiment_retryable(store, prop, status="promotion_stale")
+        elif status == "lapsed":
+            _mark_experiment_retryable(store, prop, status="promotion_lapsed")
+        elif status == "expired":
+            _mark_experiment_retryable(store, prop, status="promotion_expired")
+        if status in {"stale", "lapsed", "expired", "rejected"}:
+            _sync_prompt_attempt_for_proposal(store, prop["proposal_id"], status)
+    return approval
 
 
 def apply_approved(client: SimulatorClient, store: Store) -> list[dict[str, Any]]:
-    """Apply locally known approved approvals. Body is only approval_id."""
+    """Apply locally known approved approvals. Body is only approval_id.
+
+    Processes earliest ``apply_by`` first. Simulator remains the authority on lapse/expiry.
+    """
     results: list[dict[str, Any]] = []
-    for row in store.list_controller_approvals(status="approved"):
+    rows = list(store.list_controller_approvals(status="approved"))
+
+    def _apply_by_key(row) -> tuple[int, str]:
+        apply_by = row["apply_by"]
+        # Missing apply_by sorts last; ISO timestamps sort lexicographically.
+        return (1 if not apply_by else 0, str(apply_by or ""))
+
+    rows.sort(key=_apply_by_key)
+    for row in rows:
         try:
             result = client.apply_approval(row["workflow_id"], row["approval_id"])
         except SimulatorError as exc:
@@ -475,7 +609,24 @@ def apply_approved(client: SimulatorClient, store: Store) -> list[dict[str, Any]
                 related_proposal_id=row["proposal_id"],
                 idempotency_parts=[row["approval_id"], "apply_fail", exc.code],
             )
-            if exc.code in {"approval_lapsed", "not_approved"}:
+            if exc.code == "approval_lapsed":
+                try:
+                    payload = client.get_approval(row["approval_id"])
+                    approval = _approval_from_api(payload, proposal_id=row["proposal_id"])
+                    store.upsert_controller_approval(approval)
+                    _sync_proposal_status_from_approval(store, approval)
+                except SimulatorError:
+                    # Simulator said lapsed; do not leave local row stuck on approved.
+                    _mark_approval_terminal(
+                        store,
+                        row,
+                        status="lapsed",
+                        error_code=exc.code,
+                        error_detail=str(exc.detail),
+                        raw={"from_apply_error": True},
+                    )
+            elif exc.code == "not_approved":
+                # Trust the simulator's current status — never invent lapsed here.
                 try:
                     payload = client.get_approval(row["approval_id"])
                     approval = _approval_from_api(payload, proposal_id=row["proposal_id"])
@@ -484,33 +635,35 @@ def apply_approved(client: SimulatorClient, store: Store) -> list[dict[str, Any]
                 except SimulatorError:
                     pass
             elif exc.code == "stale_base_version":
-                prop = store.get_proposal(row["proposal_id"])
-                if prop is not None:
-                    draft = ProposalDraft(
-                        proposal_id=prop["proposal_id"],
-                        workflow_id=prop["workflow_id"],
-                        base_version=prop["base_version"],
-                        status="stale",
-                        source=prop["source"],
-                        source_ref=prop["source_ref"],
-                        changed_dims=json.loads(prop["changed_dims_json"]),
-                        proposed_config=json.loads(prop["proposed_config_json"]),
-                        change_summary=prop["change_summary"],
-                        diff=json.loads(prop["diff_json"]),
-                        dry_run=json.loads(prop["dry_run_json"]),
-                        impact_score=prop["impact_score"],
-                        affected_leads=prop["affected_leads"],
-                        rationale=prop["rationale"],
-                        evidence=json.loads(prop["evidence_json"]) if prop["evidence_json"] else {},
-                        approval_id=row["approval_id"],
-                        route=prop["route"],
-                        error_code=exc.code,
-                        error_detail=str(exc.detail),
-                        created_at=prop["created_at"],
-                        updated_at=_now(),
-                        submitted_at=prop["submitted_at"],
-                    )
-                    persist_proposal(store, draft)
+                detail = exc.detail if isinstance(exc.detail, dict) else {"detail": exc.detail}
+                current_version = detail.get("current_version") if isinstance(detail, dict) else None
+                _mark_approval_terminal(
+                    store,
+                    row,
+                    status="stale",
+                    error_code=exc.code,
+                    error_detail=str(exc.detail),
+                    raw={"from_apply_error": True, "detail": detail},
+                )
+                audit(
+                    store,
+                    kind="approval_stale",
+                    summary=(
+                        f"Approval {row['approval_id']} stale vs live config "
+                        f"(base={row['base_version']} current={current_version})"
+                    ),
+                    details={
+                        "approval_id": row["approval_id"],
+                        "proposal_id": row["proposal_id"],
+                        "old_base_version": row["base_version"],
+                        "current_version": current_version,
+                        "detail": detail,
+                    },
+                    workflow_id=row["workflow_id"],
+                    related_approval_id=row["approval_id"],
+                    related_proposal_id=row["proposal_id"],
+                    idempotency_parts=[row["approval_id"], "stale", row["base_version"], current_version],
+                )
             continue
 
         approval = ControllerApproval(
@@ -654,7 +807,8 @@ def propose_experiment_exploration(
 
 
 # Once an experiment is promoted, decaying, or rolled back, do not re-submit the
-# same winner evidence as a new promotion. Rejected promotions may be retried after replan.
+# same winner evidence as a new promotion. Stale/lapsed/expired are retryable and
+# intentionally omitted so a fresh proposal can be built after replan.
 BLOCK_WINNER_REPROMOTE_STATUSES = frozenset(
     {
         "promoted",
@@ -662,8 +816,26 @@ BLOCK_WINNER_REPROMOTE_STATUSES = frozenset(
         "proposal_submitted",
         "decay_detected",
         "rolled_back",
+        "promotion_rejected",
     }
 )
+
+ACTIVE_WINNER_PROPOSAL_STATUSES = frozenset({"draft", "submitted", "approved"})
+
+
+def _active_winner_proposal(store: Store, experiment_id: str):
+    for prop in store.list_proposals():
+        if (
+            prop["source"] == "experiment_winner"
+            and prop["source_ref"] == experiment_id
+            and prop["status"] in ACTIVE_WINNER_PROPOSAL_STATUSES
+        ):
+            return prop
+    return None
+
+
+def _draft_from_stored_proposal(prop) -> ProposalDraft:
+    return _proposal_draft_from_row(prop)
 
 
 def promote_experiment_winners(
@@ -697,11 +869,35 @@ def promote_experiment_winners(
                 reason=attn_reason,
             )
             continue
-        # Refresh live config before proposing (avoid stale base).
+        # Only one active winner proposal per experiment (crash-safe resume).
         try:
             live = client.workflow_config(exp.workflow_id)
         except SimulatorError:
             live = config
+        active = _active_winner_proposal(store, exp.experiment_id)
+        if active is not None:
+            if active["status"] == "draft":
+                if int(active["base_version"]) != int(live.version):
+                    # Live config moved on — do not POST the outdated draft body.
+                    outdated = _draft_from_stored_proposal(active)
+                    outdated.status = "stale"
+                    outdated.error_code = "stale_base_version"
+                    outdated.error_detail = (
+                        f"draft base_version={active['base_version']} live={live.version}"
+                    )
+                    outdated.updated_at = _now()
+                    persist_proposal(store, outdated)
+                    # Fall through and rebuild against live config with a fresh proposal ID.
+                else:
+                    submitted = submit_proposal(
+                        client, store, workflow, live, _draft_from_stored_proposal(active)
+                    )
+                    out.append(submitted)
+                    continue
+            else:
+                # submitted/approved — leave the in-flight proposal alone.
+                continue
+        # Always rebuild against the live config — never reuse a stale/lapsed body.
         draft = build_winner_proposal(store, workflow, live, exp)
         if draft is None:
             continue

@@ -42,10 +42,57 @@ BLOCKING_ATTEMPT_STATUSES = frozenset(
         "proposed",
         "submitted",
         "no_safe_candidate",
+        "proposal_rejected",
     }
 )
-# Retry only after these terminal-but-retryable failures (e.g. credits returned later).
-RETRYABLE_ATTEMPT_STATUSES = frozenset({"credit_exhausted", "transport_error", "failed_retryable"})
+# Retry only after these terminal-but-retryable failures (e.g. credits returned later,
+# or a related approval became stale/lapsed/expired without human rejection).
+RETRYABLE_ATTEMPT_STATUSES = frozenset(
+    {
+        "credit_exhausted",
+        "transport_error",
+        "failed_retryable",
+        "proposal_stale",
+        "proposal_lapsed",
+        "proposal_expired",
+    }
+)
+
+
+def sync_attempt_with_proposal_status(store: Store, proposal_id: str, proposal_status: str) -> None:
+    """When a prompt proposal ends, release or lock the related LLM attempt accordingly."""
+    mapping = {
+        "stale": "proposal_stale",
+        "lapsed": "proposal_lapsed",
+        "expired": "proposal_expired",
+        "rejected": "proposal_rejected",
+    }
+    attempt_status = mapping.get(proposal_status)
+    if attempt_status is None:
+        return
+    for row in store.list_llm_attempts():
+        if row["related_proposal_id"] != proposal_id:
+            continue
+        if row["status"] in {"submitted", "proposed"}:
+            attempt = LlmAttempt(
+                attempt_id=row["attempt_id"],
+                incident_id=row["incident_id"],
+                workflow_id=row["workflow_id"],
+                status=attempt_status,
+                problem=row["problem"],
+                created_at=row["created_at"],
+                updated_at=_now(),
+                request=json.loads(row["request_json"]) if row["request_json"] else None,
+                response=json.loads(row["response_json"]) if row["response_json"] else None,
+                error_code=f"proposal_{proposal_status}",
+                error_detail=f"related proposal {proposal_id} became {proposal_status}",
+                credits_before=row["credits_before"],
+                credits_after=row["credits_after"],
+                selected_prompt_version=row["selected_prompt_version"],
+                selected_validation_run_id=row["selected_validation_run_id"],
+                related_proposal_id=row["related_proposal_id"],
+            )
+            store.upsert_llm_attempt(attempt)
 
 
 @dataclass

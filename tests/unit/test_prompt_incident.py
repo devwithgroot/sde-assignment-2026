@@ -13,9 +13,11 @@ from controller.persistence.repositories import Store
 from controller.services.detector import Signal
 from controller.services.incidents import open_or_refresh_incident
 from controller.services.prompt_incident import (
+    LlmAttempt,
     run_prompt_incident_cycle,
     select_validated_candidate,
     should_start_attempt,
+    sync_attempt_with_proposal_status,
     ValidationRecord,
 )
 
@@ -384,3 +386,233 @@ def test_malformed_suggestions_ignored(tmp_path):
     )
     assert report.proposed == 0
     assert store.list_llm_attempts()[0]["status"] == "no_safe_candidate"
+
+
+def test_lapsed_prompt_proposal_unblocks_new_attempt(tmp_path):
+    store = Store(tmp_path / "p7_lapse.sqlite")
+    incident = _open_halluc(store)
+    from controller.services.change_builder import ProposalDraft
+    from controller.services.governance import persist_proposal
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    persist_proposal(
+        store,
+        ProposalDraft(
+            proposal_id="prop_prompt_old",
+            workflow_id="nw_renewal",
+            base_version=1,
+            status="submitted",
+            source="prompt_incident",
+            source_ref=incident.incident_id,
+            changed_dims=["prompt_version"],
+            proposed_config={"prompt_version": "P2", "cohorts": [], "allocations": {}, "schedule": {}},
+            change_summary="prompt",
+            diff={"changed_dims": ["prompt_version"]},
+            dry_run={"validation_run_id": "val_1"},
+            impact_score=0.4,
+            affected_leads=10,
+            rationale="r",
+            evidence={"validation_run_id": "val_1", "pass_rate": 0.99},
+            approval_id="apr_p",
+            created_at=now,
+            updated_at=now,
+            submitted_at=now,
+        ),
+    )
+    store.upsert_llm_attempt(
+        LlmAttempt(
+            attempt_id="llm_old",
+            incident_id=incident.incident_id,
+            workflow_id="nw_renewal",
+            status="submitted",
+            problem="hallucination",
+            created_at=now,
+            updated_at=now,
+            selected_prompt_version="P2",
+            selected_validation_run_id="val_1",
+            related_proposal_id="prop_prompt_old",
+        )
+    )
+    ok, reason = should_start_attempt(store, incident)
+    assert ok is False
+
+    sync_attempt_with_proposal_status(store, "prop_prompt_old", "lapsed")
+    attempt = store.list_llm_attempts(incident.incident_id)[0]
+    assert attempt["status"] == "proposal_lapsed"
+    ok2, reason2 = should_start_attempt(store, incident)
+    assert ok2 is True
+    assert "retry" in reason2
+
+    # New cycle must still require validation evidence before proposing.
+    calls = {"validate": 0, "suggest": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/llm/suggest-fixes":
+            calls["suggest"] += 1
+            return httpx.Response(
+                200,
+                json={
+                    "suggestions": [{"prompt_version": "P3", "summary": "safer"}],
+                    "credits_remaining": 40,
+                },
+            )
+        if request.url.path == "/validation/runs":
+            calls["validate"] += 1
+            return httpx.Response(
+                200,
+                json={
+                    "validation_run_id": "val_new",
+                    "workflow_id": "nw_renewal",
+                    "prompt_version": "P3",
+                    "n": 200,
+                    "failures": 1,
+                    "pass_rate": 0.995,
+                    "credits_remaining": 38,
+                },
+            )
+        if request.url.path == "/approvals":
+            body = json.loads(request.content.decode())
+            assert body["evidence"]["validation_run_id"] == "val_new"
+            assert body["proposal_id"] != "prop_prompt_old"
+            return httpx.Response(
+                200,
+                json={
+                    "approval_id": "apr_new",
+                    "proposal_id": body["proposal_id"],
+                    "workflow_id": "nw_renewal",
+                    "status": "pending",
+                    "base_version": body["base_version"],
+                    "changed_dims": ["prompt_version"],
+                },
+            )
+        if request.url.path.endswith("/config"):
+            return httpx.Response(200, json=_config().model_dump())
+        raise AssertionError(request.url.path)
+
+    report = run_prompt_incident_cycle(
+        _client(handler), store, [_workflow()], [_config()], _state(), mutate=True
+    )
+    assert calls["suggest"] == 1
+    assert calls["validate"] >= 1
+    assert report.submitted == 1
+    props = [p for p in store.list_proposals() if p["status"] == "submitted"]
+    assert any(p["proposal_id"] != "prop_prompt_old" for p in props)
+    store.close()
+
+
+def test_human_rejected_prompt_proposal_blocks_retry(tmp_path):
+    """Human rejection via reconcile_approvals is non-retryable — no auto remediations."""
+    store = Store(tmp_path / "p7_reject.sqlite")
+    incident = _open_halluc(store)
+    from controller.services.change_builder import ProposalDraft
+    from controller.services.governance import ControllerApproval, persist_proposal, reconcile_approvals
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).isoformat()
+    persist_proposal(
+        store,
+        ProposalDraft(
+            proposal_id="prop_prompt_rej",
+            workflow_id="nw_renewal",
+            base_version=1,
+            status="submitted",
+            source="prompt_incident",
+            source_ref=incident.incident_id,
+            changed_dims=["prompt_version"],
+            proposed_config={"prompt_version": "P2", "cohorts": [], "allocations": {}, "schedule": {}},
+            change_summary="prompt",
+            diff={"changed_dims": ["prompt_version"]},
+            dry_run={"validation_run_id": "val_1"},
+            impact_score=0.4,
+            affected_leads=10,
+            rationale="r",
+            evidence={"validation_run_id": "val_1", "pass_rate": 0.99},
+            approval_id="apr_rej",
+            created_at=now,
+            updated_at=now,
+            submitted_at=now,
+        ),
+    )
+    store.upsert_llm_attempt(
+        LlmAttempt(
+            attempt_id="llm_rej",
+            incident_id=incident.incident_id,
+            workflow_id="nw_renewal",
+            status="submitted",
+            problem="hallucination",
+            created_at=now,
+            updated_at=now,
+            selected_prompt_version="P2",
+            selected_validation_run_id="val_1",
+            related_proposal_id="prop_prompt_rej",
+        )
+    )
+    store.upsert_controller_approval(
+        ControllerApproval(
+            approval_id="apr_rej",
+            proposal_id="prop_prompt_rej",
+            workflow_id="nw_renewal",
+            status="pending",
+            base_version=1,
+            changed_dims=["prompt_version"],
+            updated_at=now,
+            created_at=now,
+        )
+    )
+
+    def reconcile_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/approvals/apr_rej":
+            return httpx.Response(
+                200,
+                json={
+                    "approval_id": "apr_rej",
+                    "proposal_id": "prop_prompt_rej",
+                    "workflow_id": "nw_renewal",
+                    "status": "rejected",
+                    "base_version": 1,
+                    "changed_dims": ["prompt_version"],
+                    "reasons": ["approver declined (judgement call)"],
+                    "decided_at": "t",
+                },
+            )
+        raise AssertionError(request.url.path)
+
+    updated = reconcile_approvals(_client(reconcile_handler), store)
+    assert any(a.approval_id == "apr_rej" and a.status == "rejected" for a in updated)
+    assert store.get_proposal("prop_prompt_rej")["status"] == "rejected"
+    assert store.get_controller_approval("apr_rej")["status"] == "rejected"
+    attempt = store.list_llm_attempts(incident.incident_id)[0]
+    assert attempt["status"] == "proposal_rejected"
+
+    ok, reason = should_start_attempt(store, incident)
+    assert ok is False
+    assert "proposal_rejected" in reason
+
+    calls = {"suggest": 0, "validate": 0, "approvals": 0}
+
+    def cycle_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/llm/suggest-fixes":
+            calls["suggest"] += 1
+            raise AssertionError("must not suggest after human rejection")
+        if request.url.path == "/validation/runs":
+            calls["validate"] += 1
+            raise AssertionError("must not validate after human rejection")
+        if request.url.path == "/approvals":
+            calls["approvals"] += 1
+            raise AssertionError("must not submit after human rejection")
+        if request.url.path.endswith("/config"):
+            return httpx.Response(200, json=_config().model_dump())
+        raise AssertionError(request.url.path)
+
+    report = run_prompt_incident_cycle(
+        _client(cycle_handler), store, [_workflow()], [_config()], _state(), mutate=True
+    )
+    assert calls["suggest"] == 0
+    assert calls["validate"] == 0
+    assert calls["approvals"] == 0
+    assert report.submitted == 0
+    assert report.proposed == 0
+    assert report.skipped_duplicate >= 1
+    assert store.get_proposal("prop_prompt_rej")["status"] == "rejected"
+    store.close()
