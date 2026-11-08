@@ -15,6 +15,8 @@ class Settings:
     log_level: str = "INFO"
     db_path: str = "data/controller.sqlite"
     governance_enabled: bool = True
+    advance_minutes: int = 60
+    run_until_finished: bool = True
 
     @classmethod
     def from_env(
@@ -23,6 +25,8 @@ class Settings:
         db_path: str | None = None,
         *,
         governance_enabled: bool | None = None,
+        advance_minutes: int | None = None,
+        run_until_finished: bool | None = None,
     ) -> Settings:
         url = (sim_url or os.environ.get("SIM_URL") or "").strip().rstrip("/")
         if not url:
@@ -37,10 +41,19 @@ class Settings:
             governance = raw not in {"0", "false", "no", "off"}
         else:
             governance = governance_enabled
+        if advance_minutes is None:
+            advance_minutes = int(os.environ.get("CONTROLLER_ADVANCE_MINUTES", "60"))
+        if run_until_finished is None:
+            raw_loop = os.environ.get("CONTROLLER_UNTIL_FINISHED", "1").strip().lower()
+            until_finished = raw_loop not in {"0", "false", "no", "off"}
+        else:
+            until_finished = run_until_finished
         if timeout <= 0 or chunk_timeout <= 0:
             raise ValueError("timeouts must be positive")
         if retries < 0:
             raise ValueError("CONTROLLER_MAX_RETRIES must be >= 0")
+        if advance_minutes <= 0 or advance_minutes % 15 != 0:
+            raise ValueError("CONTROLLER_ADVANCE_MINUTES must be a positive multiple of 15")
         return cls(
             sim_url=url,
             timeout_seconds=timeout,
@@ -49,4 +62,6 @@ class Settings:
             log_level=level,
             db_path=database,
             governance_enabled=governance,
+            advance_minutes=advance_minutes,
+            run_until_finished=until_finished,
         )

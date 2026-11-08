@@ -18,6 +18,7 @@ from controller.services.audit import audit
 from controller.services.change_builder import (
     ProposalDraft,
     auto_apply_permitted,
+    build_explore_proposal,
     build_rollback_proposal,
     build_winner_proposal,
 )
@@ -157,7 +158,9 @@ def submit_proposal(
         },
         workflow_id=draft.workflow_id,
         related_proposal_id=draft.proposal_id,
-        related_experiment_id=draft.source_ref if draft.source == "experiment_winner" else None,
+        related_experiment_id=(
+            draft.source_ref if draft.source in {"experiment_winner", "experiment_explore"} else None
+        ),
         idempotency_parts=[draft.proposal_id, "built"],
     )
 
@@ -550,7 +553,12 @@ def apply_approved(client: SimulatorClient, store: Store) -> list[dict[str, Any]
             )
             if prop["source"] == "experiment_winner" and prop["source_ref"]:
                 store.update_experiment_promotion(prop["source_ref"], "promoted")
-            if prop["source"] in {"experiment_winner", "decay_rollback", "incident_mitigation"}:
+            if prop["source"] in {
+                "experiment_winner",
+                "experiment_explore",
+                "decay_rollback",
+                "incident_mitigation",
+            }:
                 for incident in find_open_incidents_for_workflow(store, row["workflow_id"]):
                     if incident.related_proposal_id == row["proposal_id"] or incident.status == "mitigating":
                         resolve_incident(
@@ -583,6 +591,68 @@ def _approver_attention_ok(store: Store, workflow: Workflow) -> tuple[bool, str]
     if len(openish) >= cap:
         return False, f"approver_attention_cap open={len(openish)} cap={cap}"
     return True, "ok"
+
+
+def propose_experiment_exploration(
+    client: SimulatorClient,
+    store: Store,
+    workflows: list[Workflow],
+    configs: list[WorkflowConfig],
+    experiments: list[ExperimentState],
+) -> list[ProposalDraft]:
+    """Submit planned exploration allocations for underpowered experiments (one open explore per workflow)."""
+    by_wf = {w.workflow_id: w for w in workflows}
+    by_cfg = {c.workflow_id: c for c in configs}
+    out: list[ProposalDraft] = []
+    seen_wf: set[str] = set()
+    for exp in experiments:
+        if exp.workflow_id in seen_wf:
+            continue
+        if exp.decision not in {"underpowered", "inconclusive"} and exp.status not in {"planned", "running"}:
+            continue
+        if exp.decision == "winner":
+            continue
+        # Skip if an explore/winner proposal is already open for this experiment.
+        open_props = [
+            p
+            for p in store.recent_proposals_for_workflow(exp.workflow_id, limit=50)
+            if p["status"] in {"draft", "submitted", "approved"}
+            and p["source"] in {"experiment_explore", "experiment_winner"}
+            and p["source_ref"] == exp.experiment_id
+        ]
+        if open_props:
+            seen_wf.add(exp.workflow_id)
+            continue
+        workflow = by_wf.get(exp.workflow_id)
+        config = by_cfg.get(exp.workflow_id)
+        if workflow is None or config is None:
+            continue
+        ok_attn, attn_reason = _approver_attention_ok(store, workflow)
+        if not ok_attn:
+            from controller.services.fairness import ACTION_GOVERNANCE, FairScheduler
+
+            FairScheduler(store).record_deferral(
+                workflow_id=workflow.workflow_id,
+                tenant_id=workflow.tenant_id,
+                action_kind=ACTION_GOVERNANCE,
+                priority=5,
+                reason=attn_reason,
+            )
+            continue
+        try:
+            live = client.workflow_config(exp.workflow_id)
+        except SimulatorError:
+            live = config
+        draft = build_explore_proposal(store, workflow, live, exp)
+        if draft is None:
+            continue
+        submitted = submit_proposal(client, store, workflow, live, draft)
+        out.append(submitted)
+        seen_wf.add(exp.workflow_id)
+        if submitted.status in {"submitted", "approved", "auto_applied", "applied"}:
+            exp.promotion_status = "exploration_submitted"
+            store.upsert_experiment(exp)
+    return out
 
 
 def promote_experiment_winners(
@@ -686,11 +756,17 @@ def run_governance_cycle(
     applied = apply_approved(client, store)
     report.applied = len(applied)
 
+    explorations = propose_experiment_exploration(client, store, workflows, configs, experiments)
     promotions = promote_experiment_winners(client, store, workflows, configs, experiments)
-    report.proposals_built = len(promotions)
-    report.proposals_submitted = sum(1 for p in promotions if p.status in {"submitted", "approved", "auto_applied", "applied"})
-    report.auto_applied = sum(1 for p in promotions if p.status == "auto_applied")
+    built = explorations + promotions
+    report.proposals_built = len(built)
+    report.proposals_submitted = sum(
+        1 for p in built if p.status in {"submitted", "approved", "auto_applied", "applied"}
+    )
+    report.auto_applied = sum(1 for p in built if p.status == "auto_applied")
     report.incidents_linked = sum(1 for p in promotions if p.approval_id or p.status == "auto_applied")
+    if explorations:
+        report.notes.append(f"exploration_proposals={len(explorations)}")
 
     rollbacks = propose_decay_rollbacks(client, store, workflows, configs, decay_hits or [])
     report.rollbacks_proposed = len(rollbacks)

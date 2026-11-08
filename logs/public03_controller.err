@@ -1,0 +1,157 @@
+INFO controller {"event": "health", "ok": true}
+INFO controller {"chunks": 23, "credits_remaining": 400.0, "event": "state", "finished": false, "last_event_id": 5537379, "scenario": "public_03_load", "sim_minute": 0, "tick_minutes": 15, "ts": "2027-01-04T00:00:00+05:30"}
+INFO controller {"allowed_dims": ["schedule", "caller_id"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "northwind_life", "workflow_id": "nort_renewal_0"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "nort_renewal_0"}
+INFO controller {"allowed_dims": [], "auto_apply": false, "current_version": 1, "event": "workflow", "guardrail": {"engagement_rate_max_drop": 0.02}, "mid_flight": "next_campaign_only", "primary": "pickup_rate", "tenant_id": "northwind_life", "workflow_id": "nort_kyc_1"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "nort_kyc_1"}
+INFO controller {"allowed_dims": ["schedule", "caller_id", "welcome_message", "voice"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "northwind_life", "workflow_id": "nort_cancel_2"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "nort_cancel_2"}
+INFO controller {"allowed_dims": ["schedule", "caller_id"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "kestrel_finance", "workflow_id": "kest_renewal_0"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "kest_renewal_0"}
+INFO controller {"allowed_dims": [], "auto_apply": false, "current_version": 1, "event": "workflow", "guardrail": {"engagement_rate_max_drop": 0.02}, "mid_flight": "next_campaign_only", "primary": "pickup_rate", "tenant_id": "kestrel_finance", "workflow_id": "kest_kyc_1"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "kest_kyc_1"}
+INFO controller {"allowed_dims": ["schedule", "caller_id", "welcome_message", "voice"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "kestrel_finance", "workflow_id": "kest_cancel_2"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "kest_cancel_2"}
+INFO controller {"allowed_dims": ["schedule", "caller_id"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "aravalli_general", "workflow_id": "arav_renewal_0"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "arav_renewal_0"}
+INFO controller {"allowed_dims": [], "auto_apply": false, "current_version": 1, "event": "workflow", "guardrail": {"engagement_rate_max_drop": 0.02}, "mid_flight": "next_campaign_only", "primary": "pickup_rate", "tenant_id": "aravalli_general", "workflow_id": "arav_kyc_1"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "arav_kyc_1"}
+INFO controller {"allowed_dims": ["schedule", "caller_id", "welcome_message", "voice"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "aravalli_general", "workflow_id": "arav_cancel_2"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "arav_cancel_2"}
+INFO controller {"allowed_dims": ["schedule", "caller_id"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "tidewater_health", "workflow_id": "tide_renewal_0"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "tide_renewal_0"}
+INFO controller {"allowed_dims": [], "auto_apply": false, "current_version": 1, "event": "workflow", "guardrail": {"engagement_rate_max_drop": 0.02}, "mid_flight": "next_campaign_only", "primary": "pickup_rate", "tenant_id": "tidewater_health", "workflow_id": "tide_kyc_1"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "tide_kyc_1"}
+INFO controller {"allowed_dims": ["schedule", "caller_id", "welcome_message", "voice"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "tidewater_health", "workflow_id": "tide_cancel_2"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "tide_cancel_2"}
+INFO controller {"count": 23, "event": "chunks", "events": 5537379, "kind": "history"}
+INFO controller {"count": 0, "event": "chunks", "events": 0, "kind": "events"}
+INFO controller.ingest chunk committed kind=history chunk=0 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=history chunk=1 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=history chunk=2 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=history chunk=3 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=history chunk=4 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=history chunk=5 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=history chunk=6 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=history chunk=7 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=history chunk=8 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=history chunk=9 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=history chunk=10 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=history chunk=11 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=history chunk=12 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=history chunk=13 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=history chunk=14 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=history chunk=15 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=history chunk=16 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=history chunk=17 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=history chunk=18 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=history chunk=19 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=history chunk=20 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=history chunk=21 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=history chunk=22 inserted=37379 duplicates=0 issues=0
+INFO controller.ingest ingest kind=history fetched=23 committed=23 inserted=5537379 duplicates=0 issues=0
+INFO controller.ingest ingest kind=events fetched=0 committed=0 inserted=0 duplicates=0 issues=0
+INFO controller.joiner projected processed=5537379 campaigns=84 leads=1344000 calls=4193295 repaired=0 assignments=1344000 last_event_id=5537379
+INFO controller.observability {"approvals_pending": 12, "event": "supervisor_summary", "health": "ok", "incidents_open": 4, "proposals_pending": 12}
+INFO controller {"event": "advance", "finished": false, "minutes": 360, "new_chunks": 0, "sim_minute": 360, "ts": "2027-01-04T06:00:00+05:30"}
+INFO controller {"event": "health", "ok": true}
+INFO controller {"chunks": 23, "credits_remaining": 400.0, "event": "state", "finished": false, "last_event_id": 5537379, "scenario": "public_03_load", "sim_minute": 360, "tick_minutes": 15, "ts": "2027-01-04T06:00:00+05:30"}
+INFO controller {"allowed_dims": ["schedule", "caller_id"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "northwind_life", "workflow_id": "nort_renewal_0"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "nort_renewal_0"}
+INFO controller {"allowed_dims": [], "auto_apply": false, "current_version": 1, "event": "workflow", "guardrail": {"engagement_rate_max_drop": 0.02}, "mid_flight": "next_campaign_only", "primary": "pickup_rate", "tenant_id": "northwind_life", "workflow_id": "nort_kyc_1"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "nort_kyc_1"}
+INFO controller {"allowed_dims": ["schedule", "caller_id", "welcome_message", "voice"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "northwind_life", "workflow_id": "nort_cancel_2"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "nort_cancel_2"}
+INFO controller {"allowed_dims": ["schedule", "caller_id"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "kestrel_finance", "workflow_id": "kest_renewal_0"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "kest_renewal_0"}
+INFO controller {"allowed_dims": [], "auto_apply": false, "current_version": 1, "event": "workflow", "guardrail": {"engagement_rate_max_drop": 0.02}, "mid_flight": "next_campaign_only", "primary": "pickup_rate", "tenant_id": "kestrel_finance", "workflow_id": "kest_kyc_1"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "kest_kyc_1"}
+INFO controller {"allowed_dims": ["schedule", "caller_id", "welcome_message", "voice"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "kestrel_finance", "workflow_id": "kest_cancel_2"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "kest_cancel_2"}
+INFO controller {"allowed_dims": ["schedule", "caller_id"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "aravalli_general", "workflow_id": "arav_renewal_0"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "arav_renewal_0"}
+INFO controller {"allowed_dims": [], "auto_apply": false, "current_version": 1, "event": "workflow", "guardrail": {"engagement_rate_max_drop": 0.02}, "mid_flight": "next_campaign_only", "primary": "pickup_rate", "tenant_id": "aravalli_general", "workflow_id": "arav_kyc_1"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "arav_kyc_1"}
+INFO controller {"allowed_dims": ["schedule", "caller_id", "welcome_message", "voice"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "aravalli_general", "workflow_id": "arav_cancel_2"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "arav_cancel_2"}
+INFO controller {"allowed_dims": ["schedule", "caller_id"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "tidewater_health", "workflow_id": "tide_renewal_0"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "tide_renewal_0"}
+INFO controller {"allowed_dims": [], "auto_apply": false, "current_version": 1, "event": "workflow", "guardrail": {"engagement_rate_max_drop": 0.02}, "mid_flight": "next_campaign_only", "primary": "pickup_rate", "tenant_id": "tidewater_health", "workflow_id": "tide_kyc_1"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "tide_kyc_1"}
+INFO controller {"allowed_dims": ["schedule", "caller_id", "welcome_message", "voice"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "tidewater_health", "workflow_id": "tide_cancel_2"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "tide_cancel_2"}
+INFO controller {"count": 23, "event": "chunks", "events": 5537379, "kind": "history"}
+INFO controller {"count": 0, "event": "chunks", "events": 0, "kind": "events"}
+INFO controller.ingest ingest kind=history fetched=0 committed=0 inserted=0 duplicates=0 issues=0
+INFO controller.ingest ingest kind=events fetched=0 committed=0 inserted=0 duplicates=0 issues=0
+INFO controller.joiner projected processed=0 campaigns=0 leads=0 calls=0 repaired=0 assignments=0 last_event_id=5537379
+INFO controller.observability {"approvals_pending": 12, "event": "supervisor_summary", "health": "ok", "incidents_open": 4, "proposals_pending": 12}
+INFO controller {"event": "advance", "finished": false, "minutes": 360, "new_chunks": 2, "sim_minute": 720, "ts": "2027-01-04T12:00:00+05:30"}
+INFO controller {"event": "health", "ok": true}
+INFO controller {"chunks": 25, "credits_remaining": 400.0, "event": "state", "finished": false, "last_event_id": 5891403, "scenario": "public_03_load", "sim_minute": 720, "tick_minutes": 15, "ts": "2027-01-04T12:00:00+05:30"}
+INFO controller {"allowed_dims": ["schedule", "caller_id"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "northwind_life", "workflow_id": "nort_renewal_0"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "nort_renewal_0"}
+INFO controller {"allowed_dims": [], "auto_apply": false, "current_version": 1, "event": "workflow", "guardrail": {"engagement_rate_max_drop": 0.02}, "mid_flight": "next_campaign_only", "primary": "pickup_rate", "tenant_id": "northwind_life", "workflow_id": "nort_kyc_1"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "nort_kyc_1"}
+INFO controller {"allowed_dims": ["schedule", "caller_id", "welcome_message", "voice"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "northwind_life", "workflow_id": "nort_cancel_2"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "nort_cancel_2"}
+INFO controller {"allowed_dims": ["schedule", "caller_id"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "kestrel_finance", "workflow_id": "kest_renewal_0"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "kest_renewal_0"}
+INFO controller {"allowed_dims": [], "auto_apply": false, "current_version": 1, "event": "workflow", "guardrail": {"engagement_rate_max_drop": 0.02}, "mid_flight": "next_campaign_only", "primary": "pickup_rate", "tenant_id": "kestrel_finance", "workflow_id": "kest_kyc_1"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "kest_kyc_1"}
+INFO controller {"allowed_dims": ["schedule", "caller_id", "welcome_message", "voice"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "kestrel_finance", "workflow_id": "kest_cancel_2"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "kest_cancel_2"}
+INFO controller {"allowed_dims": ["schedule", "caller_id"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "aravalli_general", "workflow_id": "arav_renewal_0"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "arav_renewal_0"}
+INFO controller {"allowed_dims": [], "auto_apply": false, "current_version": 1, "event": "workflow", "guardrail": {"engagement_rate_max_drop": 0.02}, "mid_flight": "next_campaign_only", "primary": "pickup_rate", "tenant_id": "aravalli_general", "workflow_id": "arav_kyc_1"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "arav_kyc_1"}
+INFO controller {"allowed_dims": ["schedule", "caller_id", "welcome_message", "voice"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "aravalli_general", "workflow_id": "arav_cancel_2"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "arav_cancel_2"}
+INFO controller {"allowed_dims": ["schedule", "caller_id"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "tidewater_health", "workflow_id": "tide_renewal_0"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "tide_renewal_0"}
+INFO controller {"allowed_dims": [], "auto_apply": false, "current_version": 1, "event": "workflow", "guardrail": {"engagement_rate_max_drop": 0.02}, "mid_flight": "next_campaign_only", "primary": "pickup_rate", "tenant_id": "tidewater_health", "workflow_id": "tide_kyc_1"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "tide_kyc_1"}
+INFO controller {"allowed_dims": ["schedule", "caller_id", "welcome_message", "voice"], "auto_apply": true, "current_version": 1, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "tidewater_health", "workflow_id": "tide_cancel_2"}
+INFO controller {"actor": "business_default", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 1, "workflow_id": "tide_cancel_2"}
+INFO controller {"count": 23, "event": "chunks", "events": 5537379, "kind": "history"}
+INFO controller {"count": 2, "event": "chunks", "events": 354024, "kind": "events"}
+INFO controller.ingest ingest kind=history fetched=0 committed=0 inserted=0 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=events chunk=23 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=events chunk=24 inserted=104024 duplicates=0 issues=0
+INFO controller.ingest ingest kind=events fetched=2 committed=2 inserted=354024 duplicates=0 issues=0
+INFO controller.joiner projected processed=354024 campaigns=12 leads=192000 calls=162000 repaired=0 assignments=192000 last_event_id=5891403
+INFO controller.observability {"approvals_pending": 0, "event": "supervisor_summary", "health": "ok", "incidents_open": 4, "proposals_pending": 0}
+INFO controller {"event": "advance", "finished": false, "minutes": 360, "new_chunks": 2, "sim_minute": 1080, "ts": "2027-01-04T18:00:00+05:30"}
+INFO controller {"event": "health", "ok": true}
+INFO controller {"chunks": 27, "credits_remaining": 400.0, "event": "state", "finished": false, "last_event_id": 6215415, "scenario": "public_03_load", "sim_minute": 1080, "tick_minutes": 15, "ts": "2027-01-04T18:00:00+05:30"}
+INFO controller {"allowed_dims": ["schedule", "caller_id"], "auto_apply": true, "current_version": 2, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "northwind_life", "workflow_id": "nort_renewal_0"}
+INFO controller {"actor": "controller_approved", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 2, "workflow_id": "nort_renewal_0"}
+INFO controller {"allowed_dims": [], "auto_apply": false, "current_version": 2, "event": "workflow", "guardrail": {"engagement_rate_max_drop": 0.02}, "mid_flight": "next_campaign_only", "primary": "pickup_rate", "tenant_id": "northwind_life", "workflow_id": "nort_kyc_1"}
+INFO controller {"actor": "controller_approved", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 2, "workflow_id": "nort_kyc_1"}
+INFO controller {"allowed_dims": ["schedule", "caller_id", "welcome_message", "voice"], "auto_apply": true, "current_version": 2, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "northwind_life", "workflow_id": "nort_cancel_2"}
+INFO controller {"actor": "controller_approved", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 2, "workflow_id": "nort_cancel_2"}
+INFO controller {"allowed_dims": ["schedule", "caller_id"], "auto_apply": true, "current_version": 2, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "kestrel_finance", "workflow_id": "kest_renewal_0"}
+INFO controller {"actor": "controller_approved", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 2, "workflow_id": "kest_renewal_0"}
+INFO controller {"allowed_dims": [], "auto_apply": false, "current_version": 2, "event": "workflow", "guardrail": {"engagement_rate_max_drop": 0.02}, "mid_flight": "next_campaign_only", "primary": "pickup_rate", "tenant_id": "kestrel_finance", "workflow_id": "kest_kyc_1"}
+INFO controller {"actor": "controller_approved", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 2, "workflow_id": "kest_kyc_1"}
+INFO controller {"allowed_dims": ["schedule", "caller_id", "welcome_message", "voice"], "auto_apply": true, "current_version": 2, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "kestrel_finance", "workflow_id": "kest_cancel_2"}
+INFO controller {"actor": "controller_approved", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 2, "workflow_id": "kest_cancel_2"}
+INFO controller {"allowed_dims": ["schedule", "caller_id"], "auto_apply": true, "current_version": 2, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "aravalli_general", "workflow_id": "arav_renewal_0"}
+INFO controller {"actor": "controller_approved", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 2, "workflow_id": "arav_renewal_0"}
+INFO controller {"allowed_dims": [], "auto_apply": false, "current_version": 2, "event": "workflow", "guardrail": {"engagement_rate_max_drop": 0.02}, "mid_flight": "next_campaign_only", "primary": "pickup_rate", "tenant_id": "aravalli_general", "workflow_id": "arav_kyc_1"}
+INFO controller {"actor": "controller_approved", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 2, "workflow_id": "arav_kyc_1"}
+INFO controller {"allowed_dims": ["schedule", "caller_id", "welcome_message", "voice"], "auto_apply": true, "current_version": 2, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "aravalli_general", "workflow_id": "arav_cancel_2"}
+INFO controller {"actor": "controller_approved", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 2, "workflow_id": "arav_cancel_2"}
+INFO controller {"allowed_dims": ["schedule", "caller_id"], "auto_apply": true, "current_version": 2, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "tidewater_health", "workflow_id": "tide_renewal_0"}
+INFO controller {"actor": "controller_approved", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 2, "workflow_id": "tide_renewal_0"}
+INFO controller {"allowed_dims": [], "auto_apply": false, "current_version": 2, "event": "workflow", "guardrail": {"engagement_rate_max_drop": 0.02}, "mid_flight": "next_campaign_only", "primary": "pickup_rate", "tenant_id": "tidewater_health", "workflow_id": "tide_kyc_1"}
+INFO controller {"actor": "controller_approved", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 2, "workflow_id": "tide_kyc_1"}
+INFO controller {"allowed_dims": ["schedule", "caller_id", "welcome_message", "voice"], "auto_apply": true, "current_version": 2, "event": "workflow", "guardrail": {"pickup_rate_max_drop": 0.02}, "mid_flight": "allowed", "primary": "engagement_rate", "tenant_id": "tidewater_health", "workflow_id": "tide_cancel_2"}
+INFO controller {"actor": "controller_approved", "cohorts": 0, "event": "config", "prompt_version": "P1", "version": 2, "workflow_id": "tide_cancel_2"}
+INFO controller {"count": 23, "event": "chunks", "events": 5537379, "kind": "history"}
+INFO controller {"count": 4, "event": "chunks", "events": 678036, "kind": "events"}
+INFO controller.ingest ingest kind=history fetched=0 committed=0 inserted=0 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=events chunk=25 inserted=250000 duplicates=0 issues=0
+INFO controller.ingest chunk committed kind=events chunk=26 inserted=74012 duplicates=0 issues=0
+INFO controller.ingest ingest kind=events fetched=2 committed=2 inserted=324012 duplicates=0 issues=0
+INFO controller.joiner projected processed=324012 campaigns=0 leads=0 calls=324000 repaired=0 assignments=0 last_event_id=6215415

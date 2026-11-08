@@ -1,7 +1,8 @@
 """HTTP client for the simulator.
 
 GET paths are always available. Governance writes (approvals / apply / auto-apply)
-are explicit methods used only by Phase 6+. This client never advances simulated time.
+and POST /sim/advance are explicit methods used by the continuous controller loop.
+The dashboard and --once / recovery paths must not call advance.
 """
 
 from __future__ import annotations
@@ -130,6 +131,27 @@ class SimulatorClient:
         if not isinstance(payload, dict):
             raise SimulatorError(
                 status=200, code="bad_response", detail="auto-apply was not an object", endpoint=path, body=payload
+            )
+        return payload
+
+    def advance(self, minutes: int) -> dict[str, Any]:
+        """POST /sim/advance. minutes must be a positive multiple of tick_minutes (usually 15)."""
+        if minutes <= 0:
+            raise ValueError("minutes must be positive")
+        try:
+            payload = self._json_request("POST", "/sim/advance", {"minutes": int(minutes)})
+        except SimulatorError as exc:
+            # Scenario already finished — treat as terminal state, not a hard crash.
+            if exc.status == 409 and exc.code == "finished":
+                return {"finished": True, "new_chunks": [], "error": "finished", "detail": exc.detail}
+            raise
+        if not isinstance(payload, dict):
+            raise SimulatorError(
+                status=200,
+                code="bad_response",
+                detail="advance was not an object",
+                endpoint="/sim/advance",
+                body=payload,
             )
         return payload
 

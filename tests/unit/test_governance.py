@@ -391,3 +391,38 @@ def test_stale_apply_marks_proposal(tmp_path):
     )
     apply_approved(client, store)
     assert store.get_proposal(draft.proposal_id)["status"] == "stale"
+
+def test_build_explore_proposal_when_underpowered(tmp_path):
+    from controller.services.change_builder import build_explore_proposal
+
+    store = Store(tmp_path / "e.sqlite")
+    exp = ExperimentState(
+        experiment_id="nw_renewal|default|welcome_message",
+        workflow_id="nw_renewal",
+        tenant_id="northwind",
+        cohort_id="default",
+        dimension="welcome_message",
+        primary_kpi="engagement",
+        guardrail_kpi="pickup",
+        guardrail_max_drop=0.02,
+        status="running",
+        control_variant="W1",
+        planned_allocation={"W1": 0.5, "W2": 0.5},
+        min_sample_per_arm=100,
+        alpha=0.05,
+        min_effect=0.02,
+        created_at="t0",
+        updated_at="t1",
+        decision="underpowered",
+        decision_reason="need samples",
+        winner_variant=None,
+        promotion_status="observe_only_not_promoted",
+        evidence={},
+        arms=[],
+    )
+    draft = build_explore_proposal(store, _workflow(), _config(), exp)
+    assert draft is not None
+    assert draft.source == "experiment_explore"
+    assert "welcome_message" in draft.changed_dims
+    assert abs(draft.proposed_config["allocations"]["default"]["welcome_message"]["W2"] - 0.5) < 1e-6
+    store.close()

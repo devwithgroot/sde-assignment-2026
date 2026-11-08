@@ -118,6 +118,105 @@ def set_allocation(
     return out
 
 
+def build_explore_proposal(
+    store: Store,
+    workflow: Workflow,
+    config: WorkflowConfig,
+    experiment: ExperimentState,
+) -> ProposalDraft | None:
+    """Propose the experiment's planned balanced allocation so underpowered arms can gather samples."""
+    if experiment.decision not in {"underpowered", "inconclusive"} and experiment.status not in {
+        "planned",
+        "running",
+    }:
+        return None
+    if experiment.decision == "winner":
+        return None
+    if experiment.dimension not in ("welcome_message", "voice"):
+        return None
+    planned = {str(k): float(v) for k, v in (experiment.planned_allocation or {}).items() if float(v) > 0}
+    if len(planned) < 2:
+        return None
+    allowed = set(getattr(workflow.options, experiment.dimension) or [])
+    if any(v not in allowed for v in planned):
+        return None
+    current = ((config.config.get("allocations") or {}).get(experiment.cohort_id) or {}).get(
+        experiment.dimension
+    ) or {}
+    current_w = {str(k): float(v) for k, v in current.items()} if isinstance(current, dict) else {}
+    if total_variation(current_w, planned) < 1e-6:
+        return None
+    proposed = set_allocation(
+        config.config,
+        cohort_id=experiment.cohort_id or DEFAULT_COHORT_ID,
+        dimension=experiment.dimension,
+        weights=planned,
+    )
+    dims = changed_dims(config.config, proposed)
+    if not dims or any(d not in ALLOCATION_DIMS for d in dims):
+        return None
+    dry = {
+        "label": "exploration_allocation",
+        "limitation": (
+            "Exploration reallocates traffic to gather samples; it does not claim a causal KPI lift."
+        ),
+        "current_allocation": current_w,
+        "planned_allocation": planned,
+        "sample_ok": False,
+        "guardrail_ok": True,
+        "impact_score": 0.25,
+        "max_shift": max_allocation_shift(config.config, proposed),
+    }
+    affected = store.leads_in_cohort(workflow.workflow_id, experiment.cohort_id) or store.uploaded_leads(
+        workflow.workflow_id
+    )
+    summary = (
+        f"Explore {experiment.dimension} on {workflow.workflow_id}/{experiment.cohort_id} "
+        f"with balanced allocation {planned}"
+    )
+    rationale = (
+        f"Experiment {experiment.experiment_id} is {experiment.decision or experiment.status}; "
+        f"submit planned allocation so each arm can reach min_sample={experiment.min_sample_per_arm}."
+    )
+    pid = proposal_id_for(
+        "explore",
+        experiment.experiment_id,
+        config.version,
+        json.dumps(planned, sort_keys=True),
+    )
+    now = _now()
+    return ProposalDraft(
+        proposal_id=pid,
+        workflow_id=workflow.workflow_id,
+        base_version=config.version,
+        status="draft",
+        source="experiment_explore",
+        source_ref=experiment.experiment_id,
+        changed_dims=dims,
+        proposed_config=proposed,
+        change_summary=summary,
+        diff={
+            "dimension": experiment.dimension,
+            "cohort_id": experiment.cohort_id,
+            "allocation": allocation_diff(current_w, planned),
+            "changed_dims": dims,
+            "max_shift": dry["max_shift"],
+        },
+        dry_run=dry,
+        impact_score=0.25,
+        affected_leads=int(affected),
+        rationale=rationale,
+        evidence={
+            "experiment_id": experiment.experiment_id,
+            "decision": experiment.decision,
+            "min_sample_per_arm": experiment.min_sample_per_arm,
+            "observe_note": "Exploration only; dry_run is not causal proof.",
+        },
+        created_at=now,
+        updated_at=now,
+    )
+
+
 def build_winner_proposal(
     store: Store,
     workflow: Workflow,

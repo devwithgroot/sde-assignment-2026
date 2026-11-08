@@ -100,12 +100,21 @@ def test_transport_error_after_retries():
     assert caught.value.code == "transport_error"
 
 
-def test_client_has_no_time_advance_method():
-    """Phase 6 adds governed write helpers; advancing simulated time stays forbidden."""
+def test_client_has_advance_and_governance_methods():
+    """Phase 9 continuous loop uses advance; Phase 6+ governance writes remain available."""
     names = set(dir(SimulatorClient))
-    assert "advance" not in names
-    assert "sim_advance" not in names
-    # Governed mutation helpers exist for Phase 6+.
+    assert "advance" in names
     assert "request_approval" in names
     assert "apply_approval" in names
     assert "auto_apply" in names
+
+
+def test_advance_treats_409_finished_as_terminal():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/sim/advance"
+        return httpx.Response(409, json={"error": "finished", "detail": "scenario has ended"})
+
+    with _client(handler) as client:
+        payload = client.advance(60)
+    assert payload["finished"] is True
+    assert payload["new_chunks"] == []
