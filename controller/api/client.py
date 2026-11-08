@@ -126,8 +126,14 @@ class SimulatorClient:
         return payload
 
     def auto_apply(self, workflow_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """PUT the config once.
+
+        The simulator may commit the write before a 5xx or a dropped connection.
+        Retrying that PUT would send the same base_version again and can turn
+        the uncertain write into a 409. GET and the other writes keep their retries.
+        """
         path = f"/workflows/{workflow_id}/config"
-        payload = self._json_request("PUT", path, body)
+        payload = self._json_request("PUT", path, body, max_retries=0)
         if not isinstance(payload, dict):
             raise SimulatorError(
                 status=200, code="bad_response", detail="auto-apply was not an object", endpoint=path, body=payload
@@ -196,8 +202,15 @@ class SimulatorClient:
                 status=response.status_code, code="bad_json", detail=str(exc), endpoint=path, body=response.text
             ) from exc
 
-    def _json_request(self, method: str, path: str, body: dict[str, Any]) -> Any:
-        response = self._request(method, path, json_body=body)
+    def _json_request(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any],
+        *,
+        max_retries: int | None = None,
+    ) -> Any:
+        response = self._request(method, path, json_body=body, max_retries=max_retries)
         try:
             return response.json()
         except ValueError as exc:
@@ -212,20 +225,22 @@ class SimulatorClient:
         params: dict[str, Any] | None = None,
         timeout: float | None = None,
         json_body: dict[str, Any] | None = None,
+        max_retries: int | None = None,
     ) -> httpx.Response:
+        retries = self._max_retries if max_retries is None else max_retries
         last_transport: httpx.TransportError | None = None
-        for attempt in range(self._max_retries + 1):
+        for attempt in range(retries + 1):
             try:
                 response = self._http.request(
                     method, path, params=params, timeout=timeout, json=json_body
                 )
             except httpx.TransportError as exc:
                 last_transport = exc
-                if attempt >= self._max_retries:
+                if attempt >= retries:
                     raise SimulatorError(status=0, code="transport_error", detail=str(exc), endpoint=path) from exc
                 self._backoff(attempt, None)
                 continue
-            if response.status_code >= 500 and attempt < self._max_retries:
+            if response.status_code >= 500 and attempt < retries:
                 self._backoff(attempt, response)
                 continue
             if response.status_code >= 400:

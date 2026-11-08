@@ -185,6 +185,7 @@ class _Sim:
         fail_config: bool = False,
         allow_auto_apply: bool = False,
         auto_apply_http_status: int | None = None,
+        lose_auto_apply_response: bool = False,
     ):
         self.live = config.model_dump()
         self.approvals: dict[str, dict[str, Any]] = {}
@@ -192,8 +193,9 @@ class _Sim:
         self.fail_config = fail_config
         self.allow_auto_apply = allow_auto_apply
         self.auto_apply_http_status = auto_apply_http_status
+        self.lose_auto_apply_response = lose_auto_apply_response
 
-    def client(self) -> SimulatorClient:
+    def client(self, *, max_retries: int | None = 0) -> SimulatorClient:
         state = self
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -214,6 +216,8 @@ class _Sim:
                     "applied_at": "t_auto",
                     "config": body["proposed_config"],
                 }
+                if state.lose_auto_apply_response:
+                    raise httpx.RemoteProtocolError("connection lost")
                 if state.auto_apply_http_status is not None:
                     return httpx.Response(
                         state.auto_apply_http_status,
@@ -275,12 +279,15 @@ class _Sim:
                 )
             raise AssertionError(f"{request.method} {request.url.path}")
 
-        return SimulatorClient(
-            "http://sim.test",
-            transport=httpx.MockTransport(handler),
-            sleeper=lambda _s: None,
-            max_retries=0,
-        )
+        options: dict[str, Any] = {
+            "transport": httpx.MockTransport(handler),
+            "sleeper": lambda _s: None,
+        }
+        # None keeps SimulatorClient's default (max_retries=2). Callers that
+        # pass nothing still use one attempt, matching the older rotation tests.
+        if max_retries is not None:
+            options["max_retries"] = max_retries
+        return SimulatorClient("http://sim.test", **options)
 
     def approve(self, approval_id: str) -> None:
         self.approvals[approval_id]["status"] = "approved"
@@ -297,10 +304,16 @@ def _skip_reasons(store: Store) -> list[str]:
     return reasons
 
 
-def _propose(store: Store, sim: _Sim, workflow: Workflow | None = None):
+def _propose(
+    store: Store,
+    sim: _Sim,
+    workflow: Workflow | None = None,
+    *,
+    max_retries: int | None = 0,
+):
     wf = workflow or _workflow()
     live = WorkflowConfig.model_validate(sim.live)
-    return propose_caller_id_rotations(sim.client(), store, [wf], [live])
+    return propose_caller_id_rotations(sim.client(max_retries=max_retries), store, [wf], [live])
 
 
 def _weights(config: dict[str, Any], cohort: str = "default") -> dict[str, float]:
@@ -953,6 +966,40 @@ def test_unconfirmed_submission_is_not_replaced_when_missing(tmp_path):
 
 def _put_count(sim: _Sim) -> int:
     return sum(1 for post in sim.posts if post.startswith("PUT "))
+
+
+@pytest.mark.parametrize("failure", ["http_500", "lost_connection"])
+def test_default_retries_do_not_repeat_an_uncertain_auto_apply(tmp_path, failure: str):
+    store = Store(tmp_path / f"{failure}.sqlite")
+    _seed(store, [("CID_BAD", 200, 20, 10), ("CID_OK", 200, 120, 80)])
+    incident = _open(store)
+    sim = _Sim(
+        _config(),
+        allow_auto_apply=True,
+        auto_apply_http_status=500 if failure == "http_500" else None,
+        lose_auto_apply_response=failure == "lost_connection",
+    )
+    wf = _workflow(governance=_gov(True, 0.5))
+    # Omit max_retries so SimulatorClient uses its default of 2.
+    first = _propose(store, sim, wf, max_retries=None)
+    assert len(first) == 1
+    assert first[0].status == "auto_apply_uncertain"
+    assert first[0].route == "auto_apply"
+    assert _put_count(sim) == 1
+    assert store.get_proposal(first[0].proposal_id)["status"] == "auto_apply_uncertain"
+    assert store.get_incident(incident.incident_id)["status"] == "mitigating"
+
+    recovered = _propose(store, sim, wf, max_retries=None)
+    assert len(recovered) == 1
+    assert recovered[0].proposal_id == first[0].proposal_id
+    assert recovered[0].status == "auto_applied"
+    assert _put_count(sim) == 1
+    assert "POST /approvals" not in sim.posts
+    assert _weights(sim.live["config"])["CID_BAD"] == pytest.approx(0.35)
+    linked = store.get_incident(incident.incident_id)
+    assert linked["status"] == "resolved"
+    assert linked["related_proposal_id"] == first[0].proposal_id
+    store.close()
 
 
 def test_lost_auto_apply_response_recovers_the_same_proposal(tmp_path):

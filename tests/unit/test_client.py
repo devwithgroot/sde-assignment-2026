@@ -85,6 +85,34 @@ def test_bad_json():
     assert caught.value.code == "bad_json"
 
 
+def test_auto_apply_does_not_retry_5xx_or_transport_errors():
+    """Default max_retries is 2. The config PUT is still a single attempt."""
+
+    def five_hundred(request: httpx.Request) -> httpx.Response:
+        five_hundred.calls += 1
+        assert request.method == "PUT"
+        return httpx.Response(500, json={"error": "upstream_error", "detail": "applied"})
+
+    five_hundred.calls = 0
+    with _client(five_hundred) as client:
+        with pytest.raises(SimulatorError) as caught:
+            client.auto_apply("wf", {"proposal_id": "p", "base_version": 1, "proposed_config": {}})
+    assert five_hundred.calls == 1
+    assert caught.value.status == 500
+
+    def lost(request: httpx.Request) -> httpx.Response:
+        lost.calls += 1
+        raise httpx.RemoteProtocolError("connection lost")
+
+    lost.calls = 0
+    with _client(lost) as client:
+        with pytest.raises(SimulatorError) as caught:
+            client.auto_apply("wf", {"proposal_id": "p", "base_version": 1, "proposed_config": {}})
+    assert lost.calls == 1
+    assert caught.value.status == 0
+    assert caught.value.code == "transport_error"
+
+
 def test_transport_error_after_retries():
     calls = {"n": 0}
 
