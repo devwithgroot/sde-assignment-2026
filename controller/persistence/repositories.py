@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -270,6 +271,227 @@ class Store:
                WHERE concluded = 1 AND lead_id IS NOT NULL"""
         ).fetchone()
         return int(row["n"])
+
+    def _call_filters(
+        self,
+        workflow_id: str,
+        *,
+        cohort_id: str | None = None,
+        caller_id: str | None = None,
+        start_ts: str | None = None,
+        end_ts: str | None = None,
+    ) -> tuple[str, list]:
+        clauses = ["workflow_id = ?"]
+        params: list = [workflow_id]
+        if cohort_id is not None:
+            clauses.append("cohort_id = ?")
+            params.append(cohort_id)
+        if caller_id is not None:
+            clauses.append("caller_id = ?")
+            params.append(caller_id)
+        if start_ts is not None:
+            clauses.append("ts >= ?")
+            params.append(start_ts)
+        if end_ts is not None:
+            clauses.append("ts <= ?")
+            params.append(end_ts)
+        return " AND ".join(clauses), params
+
+    def call_totals(
+        self,
+        workflow_id: str,
+        *,
+        cohort_id: str | None = None,
+        caller_id: str | None = None,
+        start_ts: str | None = None,
+        end_ts: str | None = None,
+    ) -> tuple[int, int, int, int, int]:
+        where, params = self._call_filters(
+            workflow_id, cohort_id=cohort_id, caller_id=caller_id, start_ts=start_ts, end_ts=end_ts
+        )
+        row = self.conn.execute(
+            f"""SELECT
+                    COUNT(*) AS dials,
+                    COALESCE(SUM(connected), 0) AS connected,
+                    COALESCE(SUM(engaged), 0) AS engaged,
+                    COALESCE(SUM(CASE WHEN halluc_flag = 1 THEN 1 ELSE 0 END), 0) AS halluc_flags,
+                    COALESCE(SUM(CASE WHEN halluc_flag IS NOT NULL THEN 1 ELSE 0 END), 0) AS connected_with_qa
+                FROM calls WHERE {where}""",
+            params,
+        ).fetchone()
+        return (
+            int(row["dials"]),
+            int(row["connected"]),
+            int(row["engaged"]),
+            int(row["halluc_flags"]),
+            int(row["connected_with_qa"]),
+        )
+
+    def uploaded_leads(self, workflow_id: str) -> int:
+        row = self.conn.execute("SELECT COUNT(*) AS n FROM leads WHERE workflow_id = ?", (workflow_id,)).fetchone()
+        return int(row["n"])
+
+    def leads_in_cohort(self, workflow_id: str, cohort_id: str) -> int:
+        row = self.conn.execute(
+            """SELECT COUNT(DISTINCT lead_id) AS n FROM cohort_assignments
+               WHERE workflow_id = ? AND cohort_id = ?""",
+            (workflow_id, cohort_id),
+        ).fetchone()
+        return int(row["n"])
+
+    def concluded_leads_for_workflow(
+        self,
+        workflow_id: str,
+        *,
+        cohort_id: str | None = None,
+        caller_id: str | None = None,
+        start_ts: str | None = None,
+        end_ts: str | None = None,
+    ) -> int:
+        where, params = self._call_filters(
+            workflow_id, cohort_id=cohort_id, caller_id=caller_id, start_ts=start_ts, end_ts=end_ts
+        )
+        row = self.conn.execute(
+            f"""SELECT COUNT(DISTINCT lead_id) AS n FROM calls
+                WHERE concluded = 1 AND lead_id IS NOT NULL AND {where}""",
+            params,
+        ).fetchone()
+        return int(row["n"])
+
+    def call_days(self, workflow_id: str) -> list[str]:
+        rows = self.conn.execute(
+            """SELECT DISTINCT substr(ts, 1, 10) AS day FROM calls
+               WHERE workflow_id = ? AND ts IS NOT NULL
+               ORDER BY day""",
+            (workflow_id,),
+        ).fetchall()
+        return [row["day"] for row in rows if row["day"]]
+
+    def caller_ids_for_workflow(self, workflow_id: str) -> list[str]:
+        rows = self.conn.execute(
+            """SELECT DISTINCT caller_id FROM calls
+               WHERE workflow_id = ? AND caller_id IS NOT NULL
+               ORDER BY caller_id""",
+            (workflow_id,),
+        ).fetchall()
+        return [row["caller_id"] for row in rows]
+
+    def cohort_ids_for_workflow(self, workflow_id: str) -> list[str]:
+        rows = self.conn.execute(
+            """SELECT DISTINCT cohort_id FROM calls
+               WHERE workflow_id = ? AND cohort_id IS NOT NULL
+               ORDER BY cohort_id""",
+            (workflow_id,),
+        ).fetchall()
+        return [row["cohort_id"] for row in rows]
+
+    def upsert_metric_snapshot(self, slice_) -> None:
+        # SQLite UNIQUE treats each NULL as distinct; store empty sentinels for key columns.
+        cohort_key = slice_.cohort_id if slice_.cohort_id is not None else ""
+        caller_key = slice_.caller_id if slice_.caller_id is not None else ""
+        version_key = slice_.config_version if slice_.config_version is not None else -1
+        self.conn.execute(
+            """INSERT INTO metric_snapshots (
+                   computed_at, window_label, window_start_ts, window_end_ts,
+                   workflow_id, cohort_id, caller_id, config_version,
+                   dials, connected, engaged, uploaded_leads, concluded_leads,
+                   pickup, engagement, conclusion_rate, halluc_flags, connected_with_qa, halluc_rate
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(window_label, workflow_id, cohort_id, caller_id, config_version) DO UPDATE SET
+                 computed_at = excluded.computed_at,
+                 window_start_ts = excluded.window_start_ts,
+                 window_end_ts = excluded.window_end_ts,
+                 dials = excluded.dials,
+                 connected = excluded.connected,
+                 engaged = excluded.engaged,
+                 uploaded_leads = excluded.uploaded_leads,
+                 concluded_leads = excluded.concluded_leads,
+                 pickup = excluded.pickup,
+                 engagement = excluded.engagement,
+                 conclusion_rate = excluded.conclusion_rate,
+                 halluc_flags = excluded.halluc_flags,
+                 connected_with_qa = excluded.connected_with_qa,
+                 halluc_rate = excluded.halluc_rate""",
+            (
+                _now(),
+                slice_.window_label,
+                slice_.window_start_ts,
+                slice_.window_end_ts,
+                slice_.workflow_id,
+                cohort_key,
+                caller_key,
+                version_key,
+                slice_.dials,
+                slice_.connected,
+                slice_.engaged,
+                slice_.uploaded_leads,
+                slice_.concluded_leads,
+                slice_.pickup,
+                slice_.engagement,
+                slice_.conclusion_rate,
+                slice_.halluc_flags,
+                slice_.connected_with_qa,
+                slice_.halluc_rate,
+            ),
+        )
+
+    def insert_signal(self, signal) -> bool:
+        before = self.conn.total_changes
+        self.conn.execute(
+            """INSERT INTO detection_signals (
+                   fingerprint, workflow_id, signal_type, kpi, dimension, cohort_id, caller_id,
+                   severity, baseline_value, recent_value, baseline_n, recent_n, threshold,
+                   message, evidence_json, sim_ts, created_at, suppressed
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+               ON CONFLICT(fingerprint) DO NOTHING""",
+            (
+                signal.fingerprint,
+                signal.workflow_id,
+                signal.signal_type,
+                signal.kpi,
+                signal.dimension,
+                signal.cohort_id,
+                signal.caller_id,
+                signal.severity,
+                signal.baseline_value,
+                signal.recent_value,
+                signal.baseline_n,
+                signal.recent_n,
+                signal.threshold,
+                signal.message,
+                json.dumps(signal.evidence, sort_keys=True),
+                signal.sim_ts,
+                _now(),
+            ),
+        )
+        return self.conn.total_changes > before
+
+    def list_signals(self, workflow_id: str | None = None) -> list[sqlite3.Row]:
+        if workflow_id is None:
+            return list(self.conn.execute("SELECT * FROM detection_signals ORDER BY id").fetchall())
+        return list(
+            self.conn.execute(
+                "SELECT * FROM detection_signals WHERE workflow_id = ? ORDER BY id",
+                (workflow_id,),
+            ).fetchall()
+        )
+
+    def list_metric_snapshots(self, workflow_id: str, window_label: str | None = None) -> list[sqlite3.Row]:
+        if window_label is None:
+            return list(
+                self.conn.execute(
+                    "SELECT * FROM metric_snapshots WHERE workflow_id = ? ORDER BY id",
+                    (workflow_id,),
+                ).fetchall()
+            )
+        return list(
+            self.conn.execute(
+                """SELECT * FROM metric_snapshots
+                   WHERE workflow_id = ? AND window_label = ?
+                   ORDER BY id""",
+                (workflow_id, window_label),
+            ).fetchall()
+        )
 
 
 class _Transaction:

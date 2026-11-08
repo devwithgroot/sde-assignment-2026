@@ -161,9 +161,61 @@ CREATE INDEX IF NOT EXISTS idx_calls_workflow ON calls(workflow_id);
 CREATE INDEX IF NOT EXISTS idx_calls_cohort ON calls(cohort_id);
 CREATE INDEX IF NOT EXISTS idx_calls_unmatched ON calls(lead_matched);
 CREATE INDEX IF NOT EXISTS idx_cohort_assignments_workflow ON cohort_assignments(workflow_id, config_version);
+
+CREATE TABLE IF NOT EXISTS metric_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    computed_at TEXT NOT NULL,
+    window_label TEXT NOT NULL,
+    window_start_ts TEXT,
+    window_end_ts TEXT,
+    workflow_id TEXT NOT NULL,
+    cohort_id TEXT,
+    caller_id TEXT,
+    config_version INTEGER,
+    dials INTEGER NOT NULL,
+    connected INTEGER NOT NULL,
+    engaged INTEGER NOT NULL,
+    uploaded_leads INTEGER,
+    concluded_leads INTEGER,
+    pickup REAL,
+    engagement REAL,
+    conclusion_rate REAL,
+    halluc_flags INTEGER,
+    connected_with_qa INTEGER,
+    halluc_rate REAL,
+    UNIQUE (window_label, workflow_id, cohort_id, caller_id, config_version)
+);
+
+CREATE TABLE IF NOT EXISTS detection_signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    signal_type TEXT NOT NULL,
+    kpi TEXT NOT NULL,
+    dimension TEXT,
+    cohort_id TEXT,
+    caller_id TEXT,
+    severity TEXT NOT NULL,
+    baseline_value REAL,
+    recent_value REAL,
+    baseline_n INTEGER,
+    recent_n INTEGER,
+    threshold REAL,
+    message TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    sim_ts TEXT,
+    created_at TEXT NOT NULL,
+    suppressed INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (fingerprint)
+);
+
+CREATE INDEX IF NOT EXISTS idx_metric_snapshots_workflow ON metric_snapshots(workflow_id, window_label);
+CREATE INDEX IF NOT EXISTS idx_detection_signals_workflow ON detection_signals(workflow_id, signal_type);
+CREATE INDEX IF NOT EXISTS idx_calls_ts ON calls(ts);
+CREATE INDEX IF NOT EXISTS idx_calls_caller ON calls(caller_id);
 """
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def connect(path: Path) -> sqlite3.Connection:

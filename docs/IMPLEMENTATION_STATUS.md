@@ -110,4 +110,8 @@ The Phase 2 record is `docs/IMPLEMENTATION_STATUS_PHASE2.md`.
 
 ## Phase 3
 
-The Phase 3 record is `docs/IMPLEMENTATION_STATUS_PHASE3.md`. Phase 4 has not started.
+The Phase 3 record is `docs/IMPLEMENTATION_STATUS_PHASE3.md`.
+
+## Phase 4
+
+The Phase 4 record is `docs/IMPLEMENTATION_STATUS_PHASE4.md`. Phase 5 has not started.

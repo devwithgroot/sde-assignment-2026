@@ -15,8 +15,10 @@ from dataclasses import dataclass
 from controller.api.client import SimulatorClient, SimulatorError
 from controller.api.models import ChunkMeta, SimState, Workflow, WorkflowConfig
 from controller.persistence.repositories import IngestIntegrityError, Store
+from controller.services.detector import detect_all
 from controller.services.ingestion import ingest_available
 from controller.services.joiner import WorkflowConfigRef, project_events
+from controller.services.metrics import compute_and_store_workflow_views
 from controller.settings import Settings
 
 log = logging.getLogger("controller")
@@ -141,6 +143,9 @@ def main(argv: list[str] | None = None) -> int:
                     "concluded_leads": store.concluded_lead_count(),
                     "projection_cursor": store.projection_cursor(),
                 }
+                workflow_ids = [cfg.workflow_id for cfg in report.configs]
+                kpi_slices = compute_and_store_workflow_views(store, workflow_ids)
+                signals = detect_all(store, workflow_ids)
             finally:
                 store.close()
     except (SimulatorError, IngestIntegrityError) as exc:
@@ -170,6 +175,22 @@ def main(argv: list[str] | None = None) -> int:
         f"returning_people={summary['returning_people']} concluded_leads={summary['concluded_leads']} "
         f"cursor={summary['projection_cursor']}"
     )
+    overall = [s for s in kpi_slices if s.window_label == "all" and s.cohort_id is None and s.caller_id is None]
+    for slice_ in overall:
+        pickup = "n/a" if slice_.pickup is None else f"{slice_.pickup:.4f}"
+        engagement = "n/a" if slice_.engagement is None else f"{slice_.engagement:.4f}"
+        conclusion = "n/a" if slice_.conclusion_rate is None else f"{slice_.conclusion_rate:.4f}"
+        print(
+            f"kpi {slice_.workflow_id} dials={slice_.dials} connected={slice_.connected} "
+            f"pickup={pickup} engagement={engagement} conclusion={conclusion} "
+            f"uploaded={slice_.uploaded_leads} concluded={slice_.concluded_leads}"
+        )
+    print(f"signals open={len(signals)}")
+    for signal in signals:
+        print(
+            f"  signal {signal.workflow_id} {signal.signal_type} severity={signal.severity} "
+            f"{signal.message}"
+        )
     for workflow, config in zip(report.workflows, report.configs, strict=True):
         print(
             f"  {workflow.workflow_id} version={config.version} primary={workflow.objective.primary} "
