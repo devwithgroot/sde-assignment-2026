@@ -749,6 +749,21 @@ def propose_decay_rollbacks(
         )
         if draft is None:
             continue
+        if draft.status == "conflict":
+            # Record the clash for a person to review. Do not POST a config change.
+            persist_proposal(store, draft)
+            audit(
+                store,
+                kind="rollback_conflict",
+                summary=draft.change_summary,
+                details=draft.diff,
+                workflow_id=draft.workflow_id,
+                related_proposal_id=draft.proposal_id,
+                related_experiment_id=draft.source_ref,
+                idempotency_parts=[draft.proposal_id, "conflict"],
+            )
+            out.append(draft)
+            continue
         submitted = submit_proposal(client, store, workflow, live, draft)
         out.append(submitted)
     return out

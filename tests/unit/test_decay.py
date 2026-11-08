@@ -418,8 +418,10 @@ def test_decay_lifecycle_rolls_back_to_v1_and_blocks_repromote(tmp_path):
     assert rb.route == "approval"
     assert rb.status == "submitted"
     assert rb.proposed_config["allocations"]["default"]["welcome_message"] == {"W1": 1.0}
-    assert rb.changed_dims
-    assert "welcome_message" in rb.changed_dims
+    assert rb.proposed_config["allocations"]["default"]["voice"] == {"V1": 1.0}
+    assert rb.proposed_config["prompt_version"] == "P1"
+    assert rb.changed_dims == ["welcome_message"]
+    assert rb.evidence.get("targeted") is True
     assert "PUT" not in " ".join(sim.posts)
 
     # Next experiment cycle must not re-promote the decayed winner.
@@ -448,4 +450,83 @@ def test_decay_lifecycle_rolls_back_to_v1_and_blocks_repromote(tmp_path):
     assert store.get_experiment(experiment_id)["promotion_status"] == "rolled_back"
     assert promote_experiment_winners(client, store, [_workflow(version=3)], [v3], after) == []
     assert propose_decay_rollbacks(client, store, [_workflow(version=3)], [v3], hits) == []
+    store.close()
+
+
+def _promoted_decay(store: Store):
+    """Run original config → winner approval → decay. Returns (sim, experiment_id, hits)."""
+    v1 = _v1_config()
+    _seed_winner(store)
+    planned = run_workflow_experiments(store, _workflow(), v1, min_sample=100)
+    assert planned and planned[0].status == "winner"
+    experiment_id = planned[0].experiment_id
+    persist_experiment(store, planned[0])
+    sim = _SimState(v1)
+    _promote_winner_via_approval(store, sim, planned[0])
+    _clear_facts(store)
+    _seed_decay_window(store)
+    v2 = WorkflowConfig.model_validate(sim.live)
+    run_workflow_experiments(store, _workflow(version=2), v2, min_sample=100)
+    hits = detect_promoted_decay(store)
+    assert len(hits) == 1
+    assert store.get_experiment(experiment_id)["promotion_status"] == "decay_detected"
+    return sim, experiment_id, hits
+
+
+def test_rollback_keeps_unrelated_supervisor_change(tmp_path):
+    store = Store(tmp_path / "keep.sqlite")
+    sim, experiment_id, hits = _promoted_decay(store)
+    sim.live["config"]["allocations"]["default"]["voice"] = {"V1": 0.25, "V2": 0.75}
+    sim.live["config"]["schedule"] = {"hour_weights": {"default": {"11": 1}}}
+    sim.posts.clear()
+    client = sim.client()
+    v2 = WorkflowConfig.model_validate(sim.live)
+    proposed = propose_decay_rollbacks(client, store, [_workflow(version=2)], [v2], hits)
+    assert len(proposed) == 1
+    rb = proposed[0]
+    assert rb.status == "submitted"
+    assert rb.route == "approval"
+    assert rb.source_ref == experiment_id
+    assert rb.changed_dims == ["welcome_message"]
+    assert rb.proposed_config["allocations"]["default"]["welcome_message"] == {"W1": 1.0}
+    assert rb.proposed_config["allocations"]["default"]["voice"] == {"V1": 0.25, "V2": 0.75}
+    assert rb.proposed_config["schedule"] == {"hour_weights": {"default": {"11": 1}}}
+    assert "PUT" not in " ".join(sim.posts)
+    assert any(p == "POST /approvals" for p in sim.posts)
+
+    assert rb.approval_id
+    sim.approve(rb.approval_id)
+    reconcile_approvals(client, store)
+    applied = apply_approved(client, store)
+    assert applied and applied[0]["version"] == 3
+    assert sim.live["config"]["allocations"]["default"]["welcome_message"] == {"W1": 1.0}
+    assert sim.live["config"]["allocations"]["default"]["voice"] == {"V1": 0.25, "V2": 0.75}
+    assert sim.live["config"]["schedule"] == {"hour_weights": {"default": {"11": 1}}}
+    store.close()
+
+
+def test_rollback_does_not_overwrite_same_dimension_conflict(tmp_path):
+    store = Store(tmp_path / "clash.sqlite")
+    sim, experiment_id, hits = _promoted_decay(store)
+    edited = {"W1": 0.1, "W2": 0.9}
+    sim.live["config"]["allocations"]["default"]["welcome_message"] = dict(edited)
+    sim.posts.clear()
+    client = sim.client()
+    v2 = WorkflowConfig.model_validate(sim.live)
+    proposed = propose_decay_rollbacks(client, store, [_workflow(version=2)], [v2], hits)
+    assert len(proposed) == 1
+    rb = proposed[0]
+    assert rb.status == "conflict"
+    assert rb.source_ref == experiment_id
+    assert rb.changed_dims == []
+    assert rb.approval_id is None
+    assert rb.evidence.get("conflict") is True
+    assert rb.evidence.get("dimension") == "welcome_message"
+    assert rb.proposed_config["allocations"]["default"]["welcome_message"] == edited
+    assert "PUT" not in " ".join(sim.posts)
+    assert "POST /approvals" not in sim.posts
+    assert sim.live["config"]["allocations"]["default"]["welcome_message"] == edited
+    stored = store.get_proposal(rb.proposal_id)
+    assert stored is not None
+    assert stored["status"] == "conflict"
     store.close()

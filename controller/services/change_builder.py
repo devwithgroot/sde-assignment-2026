@@ -416,6 +416,40 @@ def build_prompt_proposal(
     )
 
 
+def _allocation_weights(config: dict[str, Any], cohort_id: str, dimension: str) -> dict[str, float]:
+    """Normalised positive weights for one cohort dimension. Missing block is empty."""
+    raw = ((config.get("allocations") or {}).get(cohort_id) or {}).get(dimension) or {}
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict[str, float] = {}
+    for key, value in raw.items():
+        try:
+            weight = float(value)
+        except (TypeError, ValueError):
+            continue
+        if weight > 0:
+            cleaned[str(key)] = weight
+    total = sum(cleaned.values())
+    if total <= 0:
+        return {}
+    return {key: weight / total for key, weight in cleaned.items()}
+
+
+def _weights_match(left: dict[str, float], right: dict[str, float], *, tol: float = 1e-6) -> bool:
+    keys = set(left) | set(right)
+    return all(abs(left.get(key, 0.0) - right.get(key, 0.0)) <= tol for key in keys)
+
+
+def _applied_winner_proposal_id(store: Store, workflow_id: str, experiment_id: str) -> str | None:
+    """Most recent applied winner proposal for this experiment, if one exists."""
+    for prop in store.recent_proposals_for_workflow(workflow_id, limit=100):
+        if prop["source"] != "experiment_winner" or prop["source_ref"] != experiment_id:
+            continue
+        if prop["status"] in {"applied", "auto_applied"}:
+            return str(prop["proposal_id"])
+    return None
+
+
 def build_rollback_proposal(
     store: Store,
     workflow: Workflow,
@@ -424,35 +458,145 @@ def build_rollback_proposal(
     reason: str,
     source_ref: str | None = None,
 ) -> ProposalDraft | None:
-    """Restore the config frozen before the monitored winner promotion.
+    """Restore only the promoted experiment's allocation.
 
-    Uses pre_apply/rollback_candidate snapshots written when the winner proposal
-    was submitted — never the post-apply promoted config.
+    Starts from the live config. Copies the pre-promotion weight for that one
+    cohort and dimension. Leaves every other setting in place.
+
+    If the live weight for that cell no longer matches the winner's post_apply
+    snapshot, someone changed it after promotion. The draft status is then
+    ``conflict`` and the live config is not rewritten. Callers must not submit
+    that draft.
     """
+    if not source_ref:
+        return None
+    experiment = store.get_experiment(source_ref)
+    if experiment is None:
+        return None
+    dimension = str(experiment["dimension"])
+    cohort_id = str(experiment["cohort_id"] or DEFAULT_COHORT_ID)
+    if dimension not in ALLOCATION_DIMS:
+        return None
+
     snap = store.pre_promotion_rollback_snapshot(workflow.workflow_id, source_ref)
     if snap is None:
         return None
     prior = json.loads(snap["config_json"])
-    dims = changed_dims(config.config, prior)
+    prior_weights = _allocation_weights(prior, cohort_id, dimension)
+    if not prior_weights:
+        return None
+
+    live_weights = _allocation_weights(config.config, cohort_id, dimension)
+    winner_proposal_id = _applied_winner_proposal_id(store, workflow.workflow_id, source_ref)
+    post = (
+        store.snapshot_for_proposal(winner_proposal_id, "post_apply")
+        if winner_proposal_id
+        else None
+    )
+    promoted_weights = (
+        _allocation_weights(json.loads(post["config_json"]), cohort_id, dimension) if post is not None else {}
+    )
+    now = _now()
+    affected = store.uploaded_leads(workflow.workflow_id)
+
+    if post is None or not _weights_match(live_weights, promoted_weights):
+        detail = (
+            "no post_apply snapshot for the winner promotion"
+            if post is None
+            else (
+                f"live {dimension} on {cohort_id} no longer matches the promoted allocation; "
+                "a later edit may own this setting"
+            )
+        )
+        pid = proposal_id_for(
+            "rollback_conflict",
+            workflow.workflow_id,
+            source_ref,
+            config.version,
+            json.dumps(live_weights, sort_keys=True),
+            json.dumps(promoted_weights, sort_keys=True),
+        )
+        return ProposalDraft(
+            proposal_id=pid,
+            workflow_id=workflow.workflow_id,
+            base_version=config.version,
+            status="conflict",
+            source="decay_rollback",
+            source_ref=source_ref,
+            changed_dims=[],
+            proposed_config=copy.deepcopy(config.config),
+            change_summary=(
+                f"Rollback of {dimension} on {workflow.workflow_id}/{cohort_id} needs review: {detail}"
+            ),
+            diff={
+                "conflict": True,
+                "dimension": dimension,
+                "cohort_id": cohort_id,
+                "live_allocation": live_weights,
+                "promoted_allocation": promoted_weights,
+                "pre_promotion_allocation": prior_weights,
+                "reason": reason,
+            },
+            dry_run={
+                "label": "rollback_conflict_needs_review",
+                "limitation": "No configuration was changed. A person must review this before any rollback.",
+                "conflict": True,
+                "impact_score": 0.0,
+            },
+            impact_score=0.0,
+            affected_leads=int(affected),
+            rationale=f"{reason} Rollback not submitted: {detail}",
+            evidence={
+                "conflict": True,
+                "dimension": dimension,
+                "cohort_id": cohort_id,
+                "live_allocation": live_weights,
+                "promoted_allocation": promoted_weights,
+                "pre_promotion_allocation": prior_weights,
+                "winner_proposal_id": winner_proposal_id,
+                "snapshot_version": snap["version"],
+            },
+            created_at=now,
+            updated_at=now,
+        )
+
+    proposed = set_allocation(
+        config.config,
+        cohort_id=cohort_id,
+        dimension=dimension,
+        weights=prior_weights,
+    )
+    dims = changed_dims(config.config, proposed)
     if not dims:
         return None
-    if "prompt_version" in dims:
+    if dims != [dimension]:
         return None
     dry = {
-        "label": "rollback_to_pre_promotion_snapshot",
+        "label": "rollback_one_allocation",
         "limitation": (
-            "Restores the configuration that existed before the monitored winner "
-            "promotion; does not prove future KPI recovery."
+            "Restores only the promoted experiment's allocation from the pre-promotion "
+            "snapshot. Other settings stay as they are on the live config. This does not "
+            "prove future KPI recovery."
         ),
         "snapshot_version": snap["version"],
         "snapshot_source": snap["source"],
         "related_proposal_id": snap["related_proposal_id"],
+        "dimension": dimension,
+        "cohort_id": cohort_id,
         "impact_score": 0.35,
         "sample_ok": True,
         "guardrail_ok": True,
     }
-    pid = proposal_id_for("rollback", workflow.workflow_id, snap["version"], config.version, reason)
-    now = _now()
+    pid = proposal_id_for(
+        "rollback",
+        workflow.workflow_id,
+        source_ref,
+        dimension,
+        cohort_id,
+        snap["version"],
+        config.version,
+        reason,
+    )
     return ProposalDraft(
         proposal_id=pid,
         workflow_id=workflow.workflow_id,
@@ -461,18 +605,38 @@ def build_rollback_proposal(
         source="decay_rollback",
         source_ref=source_ref,
         changed_dims=dims,
-        proposed_config=prior,
-        change_summary=f"Rollback {workflow.workflow_id} to pre-promotion config version {snap['version']}",
-        diff={"changed_dims": dims, "to_version": snap["version"], "reason": reason},
+        proposed_config=proposed,
+        change_summary=(
+            f"Rollback {dimension} on {workflow.workflow_id}/{cohort_id} "
+            f"to the pre-promotion allocation from config version {snap['version']}"
+        ),
+        diff={
+            "changed_dims": dims,
+            "dimension": dimension,
+            "cohort_id": cohort_id,
+            "allocation": allocation_diff(live_weights, prior_weights),
+            "to_snapshot_version": snap["version"],
+            "reason": reason,
+            "targeted": True,
+        },
         dry_run=dry,
         impact_score=0.35,
-        affected_leads=store.uploaded_leads(workflow.workflow_id),
-        rationale=reason,
+        affected_leads=int(affected),
+        rationale=(
+            f"{reason} Restoring only {dimension} for cohort {cohort_id}. "
+            "Other dimensions, cohorts, and schedule values are left unchanged."
+        ),
         evidence={
             "rollback_from_version": config.version,
-            "rollback_to_version": snap["version"],
+            "rollback_to_snapshot_version": snap["version"],
             "snapshot_source": snap["source"],
             "related_proposal_id": snap["related_proposal_id"],
+            "winner_proposal_id": winner_proposal_id,
+            "dimension": dimension,
+            "cohort_id": cohort_id,
+            "restored_allocation": prior_weights,
+            "promoted_allocation": promoted_weights,
+            "targeted": True,
         },
         created_at=now,
         updated_at=now,
