@@ -589,7 +589,7 @@ class Store:
                  promotion_status = CASE
                    WHEN experiments.promotion_status IN (
                           'promoted', 'promoted_auto_apply', 'proposal_submitted',
-                          'decay_detected', 'exploration_submitted'
+                          'decay_detected', 'rolled_back', 'exploration_submitted'
                         )
                     AND excluded.promotion_status IN (
                           'observe_only_not_promoted', 'ready_to_propose_observe_only'
@@ -970,6 +970,41 @@ class Store:
                ORDER BY version DESC LIMIT 1""",
             (workflow_id, source),
         ).fetchone()
+
+    def snapshot_for_proposal(self, proposal_id: str, source: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            """SELECT * FROM config_snapshots
+               WHERE related_proposal_id = ? AND source = ?
+               ORDER BY version DESC LIMIT 1""",
+            (proposal_id, source),
+        ).fetchone()
+
+    def pre_promotion_rollback_snapshot(
+        self, workflow_id: str, experiment_id: str | None = None
+    ) -> sqlite3.Row | None:
+        """Config that existed before the monitored winner promotion.
+
+        Prefer the ``pre_apply`` / ``rollback_candidate`` snapshot tied to the
+        experiment's winner proposal. Fall back to the workflow's latest
+        ``rollback_candidate`` (written only for experiment_winner submits).
+        """
+        if experiment_id:
+            props = self.recent_proposals_for_workflow(workflow_id, limit=100)
+            for prop in props:
+                if prop["source"] != "experiment_winner" or prop["source_ref"] != experiment_id:
+                    continue
+                if prop["status"] not in {
+                    "submitted",
+                    "approved",
+                    "applied",
+                    "auto_applied",
+                }:
+                    continue
+                for source in ("pre_apply", "rollback_candidate"):
+                    snap = self.snapshot_for_proposal(prop["proposal_id"], source)
+                    if snap is not None:
+                        return snap
+        return self.latest_config_snapshot(workflow_id, source="rollback_candidate")
 
     def recent_approval_decision_events(self, workflow_id: str | None = None) -> list[sqlite3.Row]:
         if workflow_id is None:

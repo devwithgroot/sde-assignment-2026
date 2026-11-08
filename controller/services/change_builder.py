@@ -424,7 +424,12 @@ def build_rollback_proposal(
     reason: str,
     source_ref: str | None = None,
 ) -> ProposalDraft | None:
-    snap = store.latest_config_snapshot(workflow.workflow_id, source="rollback_candidate")
+    """Restore the config frozen before the monitored winner promotion.
+
+    Uses pre_apply/rollback_candidate snapshots written when the winner proposal
+    was submitted — never the post-apply promoted config.
+    """
+    snap = store.pre_promotion_rollback_snapshot(workflow.workflow_id, source_ref)
     if snap is None:
         return None
     prior = json.loads(snap["config_json"])
@@ -434,9 +439,14 @@ def build_rollback_proposal(
     if "prompt_version" in dims:
         return None
     dry = {
-        "label": "rollback_to_last_safe_snapshot",
-        "limitation": "Restores a previously applied controller snapshot; does not prove future KPI recovery.",
+        "label": "rollback_to_pre_promotion_snapshot",
+        "limitation": (
+            "Restores the configuration that existed before the monitored winner "
+            "promotion; does not prove future KPI recovery."
+        ),
         "snapshot_version": snap["version"],
+        "snapshot_source": snap["source"],
+        "related_proposal_id": snap["related_proposal_id"],
         "impact_score": 0.35,
         "sample_ok": True,
         "guardrail_ok": True,
@@ -452,13 +462,18 @@ def build_rollback_proposal(
         source_ref=source_ref,
         changed_dims=dims,
         proposed_config=prior,
-        change_summary=f"Rollback {workflow.workflow_id} to config version {snap['version']}",
+        change_summary=f"Rollback {workflow.workflow_id} to pre-promotion config version {snap['version']}",
         diff={"changed_dims": dims, "to_version": snap["version"], "reason": reason},
         dry_run=dry,
         impact_score=0.35,
         affected_leads=store.uploaded_leads(workflow.workflow_id),
         rationale=reason,
-        evidence={"rollback_from_version": config.version, "rollback_to_version": snap["version"]},
+        evidence={
+            "rollback_from_version": config.version,
+            "rollback_to_version": snap["version"],
+            "snapshot_source": snap["source"],
+            "related_proposal_id": snap["related_proposal_id"],
+        },
         created_at=now,
         updated_at=now,
     )

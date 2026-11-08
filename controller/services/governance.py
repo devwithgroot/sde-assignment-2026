@@ -172,15 +172,18 @@ def submit_proposal(
         source="pre_apply",
         related_proposal_id=draft.proposal_id,
     )
-    # Keep last-known-safe as rollback candidate before mutation.
-    save_snapshot(
-        store,
-        workflow_id=current.workflow_id,
-        version=current.version,
-        config=current.config,
-        source="rollback_candidate",
-        related_proposal_id=draft.proposal_id,
-    )
+    # Freeze the pre-promotion config as the decay rollback target.
+    # Only winner promotions are monitored for decay; explore/prompt/rollback
+    # must not overwrite that meaning with the live (possibly already promoted) config.
+    if draft.source == "experiment_winner":
+        save_snapshot(
+            store,
+            workflow_id=current.workflow_id,
+            version=current.version,
+            config=current.config,
+            source="rollback_candidate",
+            related_proposal_id=draft.proposal_id,
+        )
 
     if ok:
         draft.route = "auto_apply"
@@ -210,16 +213,12 @@ def submit_proposal(
                 source="post_apply",
                 related_proposal_id=draft.proposal_id,
             )
-            save_snapshot(
-                store,
-                workflow_id=draft.workflow_id,
-                version=new_version,
-                config=draft.proposed_config,
-                source="rollback_candidate",
-                related_proposal_id=draft.proposal_id,
-            )
+            # Do not replace rollback_candidate with the newly applied config —
+            # decay must restore the pre-promotion snapshot frozen at submit time.
             if draft.source_ref and draft.source == "experiment_winner":
                 store.update_experiment_promotion(draft.source_ref, "promoted_auto_apply")
+            if draft.source_ref and draft.source == "decay_rollback":
+                store.update_experiment_promotion(draft.source_ref, "rolled_back")
             audit(
                 store,
                 kind="auto_applied",
@@ -543,16 +542,11 @@ def apply_approved(client: SimulatorClient, store: Store) -> list[dict[str, Any]
                 source="post_apply",
                 related_proposal_id=row["proposal_id"],
             )
-            save_snapshot(
-                store,
-                workflow_id=row["workflow_id"],
-                version=int(result["version"]),
-                config=json.loads(prop["proposed_config_json"]),
-                source="rollback_candidate",
-                related_proposal_id=row["proposal_id"],
-            )
+            # post_apply records what went live; rollback_candidate stays the pre-promotion safe config.
             if prop["source"] == "experiment_winner" and prop["source_ref"]:
                 store.update_experiment_promotion(prop["source_ref"], "promoted")
+            if prop["source"] == "decay_rollback" and prop["source_ref"]:
+                store.update_experiment_promotion(prop["source_ref"], "rolled_back")
             if prop["source"] in {
                 "experiment_winner",
                 "experiment_explore",
@@ -659,6 +653,19 @@ def propose_experiment_exploration(
     return out
 
 
+# Once an experiment is promoted, decaying, or rolled back, do not re-submit the
+# same winner evidence as a new promotion. Rejected promotions may be retried after replan.
+BLOCK_WINNER_REPROMOTE_STATUSES = frozenset(
+    {
+        "promoted",
+        "promoted_auto_apply",
+        "proposal_submitted",
+        "decay_detected",
+        "rolled_back",
+    }
+)
+
+
 def promote_experiment_winners(
     client: SimulatorClient,
     store: Store,
@@ -672,7 +679,7 @@ def promote_experiment_winners(
     for exp in experiments:
         if exp.status != "winner" or not exp.winner_variant:
             continue
-        if exp.promotion_status in {"promoted", "promoted_auto_apply", "proposal_submitted"}:
+        if exp.promotion_status in BLOCK_WINNER_REPROMOTE_STATUSES:
             continue
         workflow = by_wf.get(exp.workflow_id)
         config = by_cfg.get(exp.workflow_id)

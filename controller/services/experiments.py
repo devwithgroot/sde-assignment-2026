@@ -36,6 +36,7 @@ STICKY_PROMOTION_STATUSES = frozenset(
         "promoted_auto_apply",
         "proposal_submitted",
         "decay_detected",
+        "rolled_back",
         "exploration_submitted",
     }
 )
