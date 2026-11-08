@@ -9,8 +9,11 @@ from fastapi.testclient import TestClient
 
 from controller.api.models import ChunkMeta, Workflow, WorkflowConfig
 from controller.persistence.repositories import Store
-from controller.services.detector import detect_workflow_issues
-from controller.services.experiments import run_workflow_experiments
+from controller.services.audit import audit
+from controller.services.change_builder import build_winner_proposal
+from controller.services.detector import Signal, detect_workflow_issues
+from controller.services.experiments import ExperimentArmState, ExperimentState, persist_experiment, run_workflow_experiments
+from controller.services.incidents import open_or_refresh_incident
 from controller.services.joiner import project_events
 from controller.services.metrics import compute_and_store_workflow_views
 from dashboard.app import create_app
@@ -70,7 +73,7 @@ def _config() -> WorkflowConfig:
     )
 
 
-def _seed(db: Path, *, with_experiments: bool = False) -> None:
+def _seed(db: Path, *, with_phase6: bool = False) -> None:
     store = Store(db)
     events = [
         {
@@ -100,8 +103,7 @@ def _seed(db: Path, *, with_experiments: bool = False) -> None:
             "qa": {"hallucination_flag": False, "flow_adherence": 0.9},
         },
     ]
-    if with_experiments:
-        # Enough connected dials on two welcome arms for an underpowered-or-decided experiment row.
+    if with_phase6:
         eid = 3
         for i in range(120):
             lead = f"a{i}"
@@ -158,8 +160,109 @@ def _seed(db: Path, *, with_experiments: bool = False) -> None:
     project_events(store)
     compute_and_store_workflow_views(store, ["nw_renewal"])
     detect_workflow_issues(store, "nw_renewal")
-    if with_experiments:
+    if with_phase6:
         run_workflow_experiments(store, _workflow(), _config(), min_sample=50)
+        open_or_refresh_incident(
+            store,
+            Signal(
+                fingerprint="nw|pickup_drift|dash",
+                workflow_id="nw_renewal",
+                signal_type="pickup_drift",
+                kpi="pickup",
+                dimension="workflow",
+                cohort_id=None,
+                caller_id=None,
+                severity="high",
+                baseline_value=0.3,
+                recent_value=0.2,
+                baseline_n=200,
+                recent_n=200,
+                threshold=0.05,
+                message="pickup dropped",
+                evidence={},
+                sim_ts="t",
+            ),
+        )
+        exp = ExperimentState(
+            experiment_id="nw_renewal|default|welcome_message",
+            workflow_id="nw_renewal",
+            tenant_id="northwind",
+            cohort_id="default",
+            dimension="welcome_message",
+            primary_kpi="engagement",
+            guardrail_kpi="pickup",
+            guardrail_max_drop=0.02,
+            status="winner",
+            control_variant="W1",
+            planned_allocation={"W1": 0.45, "W2": 0.55},
+            min_sample_per_arm=50,
+            alpha=0.05,
+            min_effect=0.02,
+            created_at="t0",
+            updated_at="t1",
+            decision="winner",
+            decision_reason="W2 wins",
+            winner_variant="W2",
+            promotion_status="ready_to_propose_observe_only",
+            evidence={},
+            arms=[
+                ExperimentArmState(
+                    experiment_id="nw_renewal|default|welcome_message",
+                    variant="W1",
+                    is_control=True,
+                    planned_weight=0.45,
+                    dials=60,
+                    connected=60,
+                    engaged=20,
+                    primary_rate=0.33,
+                    guardrail_rate=1.0,
+                    sample_n=60,
+                    sample_ok=True,
+                ),
+                ExperimentArmState(
+                    experiment_id="nw_renewal|default|welcome_message",
+                    variant="W2",
+                    is_control=False,
+                    planned_weight=0.55,
+                    dials=60,
+                    connected=60,
+                    engaged=40,
+                    primary_rate=0.66,
+                    guardrail_rate=1.0,
+                    sample_n=60,
+                    sample_ok=True,
+                ),
+            ],
+        )
+        persist_experiment(store, exp)
+        draft = build_winner_proposal(store, _workflow(), _config(), exp)
+        assert draft is not None
+        draft.status = "submitted"
+        draft.approval_id = "apr_dash"
+        draft.route = "approval"
+        store.upsert_proposal(draft)
+        from controller.services.governance import ControllerApproval
+
+        store.upsert_controller_approval(
+            ControllerApproval(
+                approval_id="apr_dash",
+                proposal_id=draft.proposal_id,
+                workflow_id="nw_renewal",
+                status="pending",
+                base_version=1,
+                changed_dims=["welcome_message"],
+                updated_at="t",
+                expires_at="t_exp",
+            )
+        )
+        audit(
+            store,
+            kind="proposal_built",
+            summary="dashboard seed proposal",
+            workflow_id="nw_renewal",
+            related_proposal_id=draft.proposal_id,
+            idempotency_parts=["dash", draft.proposal_id],
+        )
     store.close()
 
 
@@ -172,53 +275,48 @@ def test_missing_db_is_error_not_fake_success(tmp_path):
     assert "not implemented" in html
 
 
-def test_snapshot_shows_kpis_and_experiment_unavailable_or_empty(tmp_path):
+def test_snapshot_phase5_without_fabricated_governance(tmp_path):
     db = tmp_path / "dash.sqlite"
-    _seed(db, with_experiments=False)
+    _seed(db, with_phase6=False)
     snap = load_snapshot(db)
     assert snap.ok is True
-    assert snap.counts["calls"] == 1
     assert snap.workflow_kpis
-    assert snap.workflow_kpis[0]["workflow_id"] == "nw_renewal"
-    # Schema creates experiments table on Store init, so available=True but may be empty /
-    # underpowered-only depending on whether evaluation ran.
-    assert snap.experiments_available is True
-    assert "proposals" in {u["key"] for u in snap.unimplemented}
-    assert "experiments" not in {u["key"] for u in snap.unimplemented}
+    assert snap.incidents_available is True
+    assert snap.proposals_available is True
+    assert snap.incidents == []
+    assert snap.proposals == []
+    assert "prompt_incident_loop" in {u["key"] for u in snap.unimplemented}
     html = render_html(snap)
-    assert "nw_renewal" in html
-    assert "Experiments" in html
+    assert "Incidents" in html
+    assert "No incident rows" in html or "empty" in html.lower()
 
 
-def test_snapshot_shows_real_experiment_rows(tmp_path):
-    db = tmp_path / "dash_exp.sqlite"
-    _seed(db, with_experiments=True)
+def test_snapshot_shows_real_phase6_rows(tmp_path):
+    db = tmp_path / "dash6.sqlite"
+    _seed(db, with_phase6=True)
     snap = load_snapshot(db)
     assert snap.ok is True
-    assert snap.experiments_available is True
-    assert snap.experiments, "expected evaluated experiment rows, not fabricated placeholders"
-    assert snap.experiment_arms
-    exp = snap.experiments[0]
-    assert exp["workflow_id"] == "nw_renewal"
-    assert exp["dimension"] in {"welcome_message", "voice"}
-    assert exp["min_sample_per_arm"] >= 50
+    assert snap.incidents
+    assert snap.proposals
+    assert snap.controller_approvals
+    assert snap.audit_decisions
     html = render_html(snap)
-    assert exp["experiment_id"] in html
-    assert "Variant arms" in html
-    assert "Observational analysis only" in html
+    assert snap.incidents[0]["incident_id"] in html
+    assert snap.proposals[0]["proposal_id"] in html
+    assert "apr_dash" in html
+    assert "Audit decisions" in html
 
 
 def test_http_endpoints_are_get_only(tmp_path):
     db = tmp_path / "dash.sqlite"
-    _seed(db, with_experiments=True)
+    _seed(db, with_phase6=True)
     app = create_app(str(db), sim_url=None)
     client = TestClient(app)
     assert client.get("/health").json()["readonly"] is True
     snap = client.get("/api/snapshot").json()
     assert snap["ok"] is True
-    assert snap["experiments_available"] is True
-    assert snap["experiments"]
-    assert "proposals" in {u["key"] for u in snap["unimplemented"]}
+    assert snap["incidents_available"] is True
+    assert snap["proposals"]
     page = client.get("/")
     assert page.status_code == 200
     assert "Read-only" in page.text

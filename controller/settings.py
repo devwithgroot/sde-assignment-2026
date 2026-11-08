@@ -14,9 +14,16 @@ class Settings:
     max_retries: int = 2
     log_level: str = "INFO"
     db_path: str = "data/controller.sqlite"
+    governance_enabled: bool = True
 
     @classmethod
-    def from_env(cls, sim_url: str | None = None, db_path: str | None = None) -> Settings:
+    def from_env(
+        cls,
+        sim_url: str | None = None,
+        db_path: str | None = None,
+        *,
+        governance_enabled: bool | None = None,
+    ) -> Settings:
         url = (sim_url or os.environ.get("SIM_URL") or "").strip().rstrip("/")
         if not url:
             raise ValueError("SIM_URL is required: pass --url or set SIM_URL")
@@ -25,6 +32,11 @@ class Settings:
         retries = int(os.environ.get("CONTROLLER_MAX_RETRIES", "2"))
         level = os.environ.get("CONTROLLER_LOG_LEVEL", "INFO").upper()
         database = db_path or os.environ.get("CONTROLLER_DB") or "data/controller.sqlite"
+        if governance_enabled is None:
+            raw = os.environ.get("CONTROLLER_GOVERNANCE", "1").strip().lower()
+            governance = raw not in {"0", "false", "no", "off"}
+        else:
+            governance = governance_enabled
         if timeout <= 0 or chunk_timeout <= 0:
             raise ValueError("timeouts must be positive")
         if retries < 0:
@@ -36,4 +48,5 @@ class Settings:
             max_retries=retries,
             log_level=level,
             db_path=database,
+            governance_enabled=governance,
         )

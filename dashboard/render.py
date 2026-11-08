@@ -163,7 +163,7 @@ def render_html(snap: DashboardSnapshot) -> str:
     if snap.experiments_available:
         if snap.experiments:
             experiments_block = f"""
-      <p class="note">Observational analysis only. Promotion / apply is Phase 6.
+      <p class="note">Experiment analysis is observational. Promotion status reflects Phase 6 governance when run.
         Status <code>running</code> or decision <code>underpowered</code> means insufficient samples — not a fabricated winner.</p>
       <h3>Experiment status</h3>
       {_rows(["id", "workflow", "cohort", "dim", "status", "decision", "control", "winner", "promotion", "min_n", "reason"], experiment_rows)}
@@ -178,6 +178,111 @@ def render_html(snap: DashboardSnapshot) -> str:
         experiments_block = """
       <p class="warn">Experiments unavailable. Phase 5 schema/evaluation has not been run against this database.</p>
 """
+
+    incident_rows = [
+        [
+            escape(str(r.get("incident_id"))),
+            escape(str(r.get("workflow_id"))),
+            escape(str(r.get("signal_type"))),
+            escape(str(r.get("severity"))),
+            escape(str(r.get("status"))),
+            escape(str(r.get("related_experiment_id") or "-")),
+            escape(str(r.get("related_proposal_id") or "-")),
+            escape(str(r.get("resolution") or "")[:120]),
+            escape(str(r.get("message") or "")[:120]),
+        ]
+        for r in snap.incidents
+    ]
+    if snap.incidents_available:
+        incidents_block = (
+            f"""
+      <p class="note">Incidents come from population detection signals. This dashboard never resolves them.</p>
+      {_rows(["id", "workflow", "type", "severity", "status", "experiment", "proposal", "resolution", "message"], incident_rows)}
+"""
+            if snap.incidents
+            else """<p class="warn">No incident rows. Empty means no signal-backed incidents yet — not a fabricated clear state.</p>"""
+        )
+    else:
+        incidents_block = """<p class="warn">Incidents unavailable. Phase 6 schema has not been applied to this database.</p>"""
+
+    proposal_rows = [
+        [
+            escape(str(r.get("proposal_id"))),
+            escape(str(r.get("workflow_id"))),
+            escape(str(r.get("status"))),
+            escape(str(r.get("source"))),
+            escape(str(r.get("route") or "-")),
+            escape(",".join(r.get("changed_dims") or []) if isinstance(r.get("changed_dims"), list) else str(r.get("changed_dims") or "")),
+            _fmt_rate(r.get("impact_score")),
+            _fmt_int(r.get("affected_leads")),
+            escape(str(r.get("approval_id") or "-")),
+            escape(str(r.get("change_summary") or "")[:100]),
+            escape(str((r.get("dry_run") or {}).get("limitation") if isinstance(r.get("dry_run"), dict) else "")[:80]),
+        ]
+        for r in snap.proposals
+    ]
+    if snap.proposals_available:
+        proposals_block = (
+            f"""
+      <p class="note">Proposals include rationale, diffs, and dry-run estimates. Dashboard cannot submit or apply them.</p>
+      {_rows(["id", "workflow", "status", "source", "route", "dims", "impact", "affected", "approval", "summary", "dry_run_note"], proposal_rows)}
+"""
+            if snap.proposals
+            else """<p class="warn">No proposals stored yet.</p>"""
+        )
+    else:
+        proposals_block = """<p class="warn">Proposals unavailable.</p>"""
+
+    approval_rows = [
+        [
+            escape(str(r.get("approval_id"))),
+            escape(str(r.get("proposal_id"))),
+            escape(str(r.get("workflow_id"))),
+            escape(str(r.get("status"))),
+            _fmt_int(r.get("base_version")),
+            escape(str(r.get("expires_at") or "-")),
+            escape(str(r.get("apply_by") or "-")),
+            escape(str(r.get("decided_at") or "-")),
+            _fmt_int(r.get("applied_version")),
+            escape(str(r.get("reasons") or "")[:120]),
+        ]
+        for r in snap.controller_approvals
+    ]
+    if snap.approvals_available:
+        approvals_block = (
+            f"""
+      <p class="note">Controller-side approval tracking. Simulator event approvals are listed separately below.</p>
+      {_rows(["approval", "proposal", "workflow", "status", "base", "expires", "apply_by", "decided", "applied_v", "reasons"], approval_rows)}
+"""
+            if snap.controller_approvals
+            else """<p class="warn">No controller approvals tracked yet.</p>"""
+        )
+    else:
+        approvals_block = """<p class="warn">Controller approvals unavailable.</p>"""
+
+    audit_rows = [
+        [
+            escape(str(r.get("decision_id"))),
+            escape(str(r.get("kind"))),
+            escape(str(r.get("workflow_id") or "-")),
+            escape(str(r.get("summary") or "")[:140]),
+            escape(str(r.get("related_proposal_id") or "-")),
+            escape(str(r.get("related_approval_id") or "-")),
+            escape(str(r.get("wall_ts") or "")),
+        ]
+        for r in snap.audit_decisions
+    ]
+    if snap.audit_available:
+        audit_block = (
+            f"""
+      <p class="note">Audit of controller decisions. Read-only; no actions from this UI.</p>
+      {_rows(["id", "kind", "workflow", "summary", "proposal", "approval", "wall_ts"], audit_rows)}
+"""
+            if snap.audit_decisions
+            else """<p class="warn">No audit rows yet.</p>"""
+        )
+    else:
+        audit_block = """<p class="warn">Audit store unavailable.</p>"""
 
     return f"""<!doctype html>
 <html lang="en">
@@ -318,9 +423,25 @@ def render_html(snap: DashboardSnapshot) -> str:
       {experiments_block}
     </section>
     <section>
+      <h2>Incidents</h2>
+      {incidents_block}
+    </section>
+    <section>
+      <h2>Proposals</h2>
+      {proposals_block}
+    </section>
+    <section>
+      <h2>Controller approvals</h2>
+      {approvals_block}
+    </section>
+    <section>
+      <h2>Audit decisions</h2>
+      {audit_block}
+    </section>
+    <section>
       <h2>Not implemented yet</h2>
       {_rows(["area", "detail", "status"], unimplemented_rows)}
-      <p class="note">Proposal lifecycle, controller approval store, and a full audit decision API arrive in Phase 6+. Experiments are shown above when evaluated.</p>
+      <p class="note">Phase 7+ surfaces (prompt LLM/validation loop, fairness scheduler UI) remain unavailable.</p>
     </section>
   </main>
 </body>

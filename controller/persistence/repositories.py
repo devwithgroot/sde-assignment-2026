@@ -247,6 +247,13 @@ class Store:
             "approval_decisions",
             "cohort_assignments",
             "events",
+            "experiments",
+            "experiment_arms",
+            "incidents",
+            "proposals",
+            "controller_approvals",
+            "audit_decisions",
+            "config_snapshots",
         }
         if table not in allowed:
             raise ValueError(table)
@@ -681,6 +688,291 @@ class Store:
             (workflow_id, cohort_id),
         ).fetchone()
         return row["dimension"] if row else None
+
+    def update_experiment_promotion(self, experiment_id: str, promotion_status: str, *, decision_reason: str | None = None) -> None:
+        if decision_reason is None:
+            self.conn.execute(
+                """UPDATE experiments SET promotion_status = ?, updated_at = ?
+                   WHERE experiment_id = ?""",
+                (promotion_status, _now(), experiment_id),
+            )
+        else:
+            self.conn.execute(
+                """UPDATE experiments SET promotion_status = ?, decision_reason = ?, updated_at = ?
+                   WHERE experiment_id = ?""",
+                (promotion_status, decision_reason, _now(), experiment_id),
+            )
+
+    def upsert_incident(self, incident) -> None:
+        self.conn.execute(
+            """INSERT INTO incidents (
+                   incident_id, workflow_id, tenant_id, signal_fingerprint, signal_type, severity,
+                   status, title, message, evidence_json, related_experiment_id, related_proposal_id,
+                   resolution, created_at, updated_at, closed_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(incident_id) DO UPDATE SET
+                 status = excluded.status,
+                 severity = excluded.severity,
+                 title = excluded.title,
+                 message = excluded.message,
+                 evidence_json = excluded.evidence_json,
+                 related_experiment_id = excluded.related_experiment_id,
+                 related_proposal_id = excluded.related_proposal_id,
+                 resolution = excluded.resolution,
+                 updated_at = excluded.updated_at,
+                 closed_at = excluded.closed_at""",
+            (
+                incident.incident_id,
+                incident.workflow_id,
+                incident.tenant_id,
+                incident.signal_fingerprint,
+                incident.signal_type,
+                incident.severity,
+                incident.status,
+                incident.title,
+                incident.message,
+                json.dumps(incident.evidence, sort_keys=True),
+                incident.related_experiment_id,
+                incident.related_proposal_id,
+                incident.resolution,
+                incident.created_at,
+                incident.updated_at,
+                incident.closed_at,
+            ),
+        )
+
+    def get_incident_by_fingerprint(self, fingerprint: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM incidents WHERE signal_fingerprint = ?", (fingerprint,)
+        ).fetchone()
+
+    def get_incident(self, incident_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM incidents WHERE incident_id = ?", (incident_id,)).fetchone()
+
+    def list_incidents(self, workflow_id: str | None = None, status: str | None = None) -> list[sqlite3.Row]:
+        clauses: list[str] = []
+        params: list = []
+        if workflow_id is not None:
+            clauses.append("workflow_id = ?")
+            params.append(workflow_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        return list(self.conn.execute(f"SELECT * FROM incidents{where} ORDER BY updated_at DESC", params).fetchall())
+
+    def upsert_proposal(self, proposal) -> None:
+        self.conn.execute(
+            """INSERT INTO proposals (
+                   proposal_id, workflow_id, base_version, status, source, source_ref,
+                   changed_dims_json, proposed_config_json, change_summary, diff_json, dry_run_json,
+                   impact_score, affected_leads, rationale, evidence_json, approval_id, route,
+                   error_code, error_detail, created_at, updated_at, submitted_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(proposal_id) DO UPDATE SET
+                 status = excluded.status,
+                 base_version = excluded.base_version,
+                 changed_dims_json = excluded.changed_dims_json,
+                 proposed_config_json = excluded.proposed_config_json,
+                 change_summary = excluded.change_summary,
+                 diff_json = excluded.diff_json,
+                 dry_run_json = excluded.dry_run_json,
+                 impact_score = excluded.impact_score,
+                 affected_leads = excluded.affected_leads,
+                 rationale = excluded.rationale,
+                 evidence_json = excluded.evidence_json,
+                 approval_id = excluded.approval_id,
+                 route = excluded.route,
+                 error_code = excluded.error_code,
+                 error_detail = excluded.error_detail,
+                 updated_at = excluded.updated_at,
+                 submitted_at = excluded.submitted_at""",
+            (
+                proposal.proposal_id,
+                proposal.workflow_id,
+                proposal.base_version,
+                proposal.status,
+                proposal.source,
+                proposal.source_ref,
+                json.dumps(proposal.changed_dims, sort_keys=True),
+                json.dumps(proposal.proposed_config, sort_keys=True),
+                proposal.change_summary,
+                json.dumps(proposal.diff, sort_keys=True),
+                json.dumps(proposal.dry_run, sort_keys=True),
+                proposal.impact_score,
+                proposal.affected_leads,
+                proposal.rationale,
+                json.dumps(proposal.evidence, sort_keys=True) if proposal.evidence is not None else None,
+                proposal.approval_id,
+                proposal.route,
+                proposal.error_code,
+                proposal.error_detail,
+                proposal.created_at,
+                proposal.updated_at,
+                proposal.submitted_at,
+            ),
+        )
+
+    def get_proposal(self, proposal_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM proposals WHERE proposal_id = ?", (proposal_id,)).fetchone()
+
+    def list_proposals(self, workflow_id: str | None = None, status: str | None = None) -> list[sqlite3.Row]:
+        clauses: list[str] = []
+        params: list = []
+        if workflow_id is not None:
+            clauses.append("workflow_id = ?")
+            params.append(workflow_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        return list(self.conn.execute(f"SELECT * FROM proposals{where} ORDER BY updated_at DESC", params).fetchall())
+
+    def upsert_controller_approval(self, approval) -> None:
+        self.conn.execute(
+            """INSERT INTO controller_approvals (
+                   approval_id, proposal_id, workflow_id, status, base_version, changed_dims_json,
+                   created_at, updated_at, expires_at, apply_by, decided_at, reasons_json,
+                   applied_version, last_reconciled_at, raw_json
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(approval_id) DO UPDATE SET
+                 status = excluded.status,
+                 base_version = excluded.base_version,
+                 changed_dims_json = excluded.changed_dims_json,
+                 updated_at = excluded.updated_at,
+                 expires_at = excluded.expires_at,
+                 apply_by = excluded.apply_by,
+                 decided_at = excluded.decided_at,
+                 reasons_json = excluded.reasons_json,
+                 applied_version = excluded.applied_version,
+                 last_reconciled_at = excluded.last_reconciled_at,
+                 raw_json = excluded.raw_json""",
+            (
+                approval.approval_id,
+                approval.proposal_id,
+                approval.workflow_id,
+                approval.status,
+                approval.base_version,
+                json.dumps(approval.changed_dims, sort_keys=True) if approval.changed_dims is not None else None,
+                approval.created_at,
+                approval.updated_at,
+                approval.expires_at,
+                approval.apply_by,
+                approval.decided_at,
+                json.dumps(approval.reasons, sort_keys=True) if approval.reasons is not None else None,
+                approval.applied_version,
+                approval.last_reconciled_at,
+                json.dumps(approval.raw, sort_keys=True) if approval.raw is not None else None,
+            ),
+        )
+
+    def get_controller_approval(self, approval_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM controller_approvals WHERE approval_id = ?", (approval_id,)
+        ).fetchone()
+
+    def list_controller_approvals(
+        self, workflow_id: str | None = None, status: str | None = None
+    ) -> list[sqlite3.Row]:
+        clauses: list[str] = []
+        params: list = []
+        if workflow_id is not None:
+            clauses.append("workflow_id = ?")
+            params.append(workflow_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        return list(
+            self.conn.execute(f"SELECT * FROM controller_approvals{where} ORDER BY updated_at DESC", params).fetchall()
+        )
+
+    def insert_audit(self, record) -> None:
+        self.conn.execute(
+            """INSERT OR IGNORE INTO audit_decisions (
+                   decision_id, kind, workflow_id, tenant_id, cohort_id,
+                   related_incident_id, related_proposal_id, related_approval_id, related_experiment_id,
+                   sim_ts, wall_ts, summary, details_json
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                record.decision_id,
+                record.kind,
+                record.workflow_id,
+                record.tenant_id,
+                record.cohort_id,
+                record.related_incident_id,
+                record.related_proposal_id,
+                record.related_approval_id,
+                record.related_experiment_id,
+                record.sim_ts,
+                record.wall_ts,
+                record.summary,
+                json.dumps(record.details, sort_keys=True),
+            ),
+        )
+
+    def list_audit(self, workflow_id: str | None = None, limit: int = 100) -> list[sqlite3.Row]:
+        if workflow_id is None:
+            return list(
+                self.conn.execute(
+                    "SELECT * FROM audit_decisions ORDER BY wall_ts DESC LIMIT ?", (limit,)
+                ).fetchall()
+            )
+        return list(
+            self.conn.execute(
+                """SELECT * FROM audit_decisions WHERE workflow_id = ?
+                   ORDER BY wall_ts DESC LIMIT ?""",
+                (workflow_id, limit),
+            ).fetchall()
+        )
+
+    def upsert_config_snapshot(self, snapshot) -> None:
+        self.conn.execute(
+            """INSERT INTO config_snapshots (
+                   snapshot_id, workflow_id, version, config_json, source, related_proposal_id, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(workflow_id, version, source) DO UPDATE SET
+                 config_json = excluded.config_json,
+                 related_proposal_id = excluded.related_proposal_id,
+                 created_at = excluded.created_at""",
+            (
+                snapshot.snapshot_id,
+                snapshot.workflow_id,
+                snapshot.version,
+                json.dumps(snapshot.config, sort_keys=True),
+                snapshot.source,
+                snapshot.related_proposal_id,
+                snapshot.created_at,
+            ),
+        )
+
+    def latest_config_snapshot(self, workflow_id: str, source: str = "rollback_candidate") -> sqlite3.Row | None:
+        return self.conn.execute(
+            """SELECT * FROM config_snapshots
+               WHERE workflow_id = ? AND source = ?
+               ORDER BY version DESC LIMIT 1""",
+            (workflow_id, source),
+        ).fetchone()
+
+    def recent_approval_decision_events(self, workflow_id: str | None = None) -> list[sqlite3.Row]:
+        if workflow_id is None:
+            return list(self.conn.execute("SELECT * FROM approval_decisions ORDER BY event_id DESC").fetchall())
+        return list(
+            self.conn.execute(
+                "SELECT * FROM approval_decisions WHERE workflow_id = ? ORDER BY event_id DESC",
+                (workflow_id,),
+            ).fetchall()
+        )
+
+    def recent_config_change_events(self, workflow_id: str | None = None) -> list[sqlite3.Row]:
+        if workflow_id is None:
+            return list(self.conn.execute("SELECT * FROM config_changes ORDER BY event_id DESC").fetchall())
+        return list(
+            self.conn.execute(
+                "SELECT * FROM config_changes WHERE workflow_id = ? ORDER BY event_id DESC",
+                (workflow_id,),
+            ).fetchall()
+        )
 
 
 class _Transaction:

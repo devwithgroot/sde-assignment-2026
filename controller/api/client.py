@@ -1,7 +1,7 @@
-"""Read-only HTTP client for the simulator.
+"""HTTP client for the simulator.
 
-Phase 1 exposes GET only. Advancing time, approvals, and config writes are
-intentionally absent so this process cannot change the world.
+GET paths are always available. Governance writes (approvals / apply / auto-apply)
+are explicit methods used only by Phase 6+. This client never advances simulated time.
 """
 
 from __future__ import annotations
@@ -86,11 +86,64 @@ class SimulatorClient:
     def chunk_text(self, n: int) -> str:
         """NDJSON body of one chunk. Does not open the path field from the metadata."""
         path = f"/events/chunks/{n}"
-        response = self._request(path, timeout=self._chunk_timeout)
+        response = self._request("GET", path, timeout=self._chunk_timeout)
         return response.text
 
+    def list_approvals(self, *, workflow_id: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {}
+        if workflow_id is not None:
+            params["workflow_id"] = workflow_id
+        if status is not None:
+            params["status"] = status
+        payload = self._get_json("/approvals", params=params or None)
+        if not isinstance(payload, list):
+            raise SimulatorError(
+                status=200, code="bad_response", detail="approvals was not a list", endpoint="/approvals", body=payload
+            )
+        return payload
+
+    def get_approval(self, approval_id: str) -> dict[str, Any]:
+        path = f"/approvals/{approval_id}"
+        payload = self._get_json(path)
+        if not isinstance(payload, dict):
+            raise SimulatorError(status=200, code="bad_response", detail="approval was not an object", endpoint=path, body=payload)
+        return payload
+
+    def request_approval(self, body: dict[str, Any]) -> dict[str, Any]:
+        payload = self._json_request("POST", "/approvals", body)
+        if not isinstance(payload, dict):
+            raise SimulatorError(
+                status=200, code="bad_response", detail="approval create was not an object", endpoint="/approvals", body=payload
+            )
+        return payload
+
+    def apply_approval(self, workflow_id: str, approval_id: str) -> dict[str, Any]:
+        path = f"/workflows/{workflow_id}/apply"
+        payload = self._json_request("POST", path, {"approval_id": approval_id})
+        if not isinstance(payload, dict):
+            raise SimulatorError(status=200, code="bad_response", detail="apply was not an object", endpoint=path, body=payload)
+        return payload
+
+    def auto_apply(self, workflow_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        path = f"/workflows/{workflow_id}/config"
+        payload = self._json_request("PUT", path, body)
+        if not isinstance(payload, dict):
+            raise SimulatorError(
+                status=200, code="bad_response", detail="auto-apply was not an object", endpoint=path, body=payload
+            )
+        return payload
+
     def _get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        response = self._request(path, params=params)
+        response = self._request("GET", path, params=params)
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise SimulatorError(
+                status=response.status_code, code="bad_json", detail=str(exc), endpoint=path, body=response.text
+            ) from exc
+
+    def _json_request(self, method: str, path: str, body: dict[str, Any]) -> Any:
+        response = self._request(method, path, json_body=body)
         try:
             return response.json()
         except ValueError as exc:
@@ -100,14 +153,18 @@ class SimulatorClient:
 
     def _request(
         self,
+        method: str,
         path: str,
         params: dict[str, Any] | None = None,
         timeout: float | None = None,
+        json_body: dict[str, Any] | None = None,
     ) -> httpx.Response:
         last_transport: httpx.TransportError | None = None
         for attempt in range(self._max_retries + 1):
             try:
-                response = self._http.get(path, params=params, timeout=timeout)
+                response = self._http.request(
+                    method, path, params=params, timeout=timeout, json=json_body
+                )
             except httpx.TransportError as exc:
                 last_transport = exc
                 if attempt >= self._max_retries:

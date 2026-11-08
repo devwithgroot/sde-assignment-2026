@@ -100,7 +100,12 @@ def test_transport_error_after_retries():
     assert caught.value.code == "transport_error"
 
 
-def test_client_has_no_mutation_methods():
+def test_client_has_no_time_advance_method():
+    """Phase 6 adds governed write helpers; advancing simulated time stays forbidden."""
     names = set(dir(SimulatorClient))
-    for forbidden in ("advance", "request_approval", "apply", "auto_apply", "put_config"):
-        assert forbidden not in names
+    assert "advance" not in names
+    assert "sim_advance" not in names
+    # Governed mutation helpers exist for Phase 6+.
+    assert "request_approval" in names
+    assert "apply_approval" in names
+    assert "auto_apply" in names

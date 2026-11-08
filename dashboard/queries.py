@@ -1,8 +1,7 @@
 """Assemble a read-only snapshot from the controller SQLite store.
 
-Phase 5 experiment tables are loaded when present. Missing Phase 6+ tables
-are reported as unavailable, not as empty successes. Experiment panels never
-fabricate winners when rows are absent or underpowered.
+Phase 5–6 tables are loaded when present. Missing later-phase surfaces are
+reported as unavailable. Never fabricates incidents, proposals, or approvals.
 """
 
 from __future__ import annotations
@@ -17,9 +16,8 @@ from controller.persistence.db import connect, init_schema
 
 
 UNIMPLEMENTED = (
-    ("proposals", "Governance proposals submitted by the controller (Phase 6+)"),
-    ("controller_approvals", "Controller-side approval lifecycle store (Phase 6+)"),
-    ("audit_decisions", "Full decision audit store beyond detection signals (Phase 6+/C12 expansion)"),
+    ("prompt_incident_loop", "LLM suggest-fixes + validation-driven prompt incident loop (Phase 7)"),
+    ("fairness_scheduler", "Tenant/workflow fair scheduler and credit reserve policy UI (Phase 8)"),
 )
 
 
@@ -43,6 +41,14 @@ class DashboardSnapshot:
     experiments: list[dict[str, Any]] = field(default_factory=list)
     experiment_arms: list[dict[str, Any]] = field(default_factory=list)
     experiments_available: bool = False
+    incidents: list[dict[str, Any]] = field(default_factory=list)
+    incidents_available: bool = False
+    proposals: list[dict[str, Any]] = field(default_factory=list)
+    proposals_available: bool = False
+    controller_approvals: list[dict[str, Any]] = field(default_factory=list)
+    approvals_available: bool = False
+    audit_decisions: list[dict[str, Any]] = field(default_factory=list)
+    audit_available: bool = False
     unimplemented: list[dict[str, str]] = field(default_factory=list)
     simulator: dict[str, Any] | None = None
 
@@ -87,7 +93,6 @@ def load_snapshot(db_path: str | Path, *, simulator: dict[str, Any] | None = Non
             conn = sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True)
             conn.row_factory = sqlite3.Row
         except sqlite3.OperationalError:
-            # Fallback if the platform rejects URI mode; still open without writes from this module.
             conn = connect(path)
             init_schema(conn)
 
@@ -109,6 +114,11 @@ def load_snapshot(db_path: str | Path, *, simulator: dict[str, Any] | None = Non
             "ingest_issues",
             "experiments",
             "experiment_arms",
+            "incidents",
+            "proposals",
+            "controller_approvals",
+            "audit_decisions",
+            "config_snapshots",
         ):
             snap.counts[table] = _count(conn, table)
 
@@ -226,8 +236,7 @@ def load_snapshot(db_path: str | Path, *, simulator: dict[str, Any] | None = Non
                 ]
             if not snap.experiments:
                 snap.warnings.append(
-                    "Experiment tables exist but no experiments have been evaluated yet. "
-                    "Run the controller observe loop after joins/KPIs."
+                    "Experiment tables exist but no experiments have been evaluated yet."
                 )
             else:
                 underpowered = [
@@ -239,9 +248,72 @@ def load_snapshot(db_path: str | Path, *, simulator: dict[str, Any] | None = Non
                     )
         else:
             snap.experiments_available = False
-            snap.warnings.append(
-                "experiments table missing — run Phase 5 controller once to create schema and evaluate."
-            )
+            snap.warnings.append("experiments table missing — run Phase 5 controller once.")
+
+        if _table_exists(conn, "incidents"):
+            snap.incidents_available = True
+            snap.incidents = []
+            for row in conn.execute("SELECT * FROM incidents ORDER BY updated_at DESC"):
+                item = dict(row)
+                item["evidence"] = _parse_json(item.get("evidence_json"))
+                snap.incidents.append(item)
+            if not snap.incidents:
+                snap.warnings.append("Incident table present but empty — no open population signals yet.")
+            else:
+                open_n = sum(1 for i in snap.incidents if i.get("status") in {"detected", "investigating", "mitigating"})
+                if open_n:
+                    snap.warnings.append(f"{open_n} incident(s) currently open / pending mitigation.")
+        else:
+            snap.incidents_available = False
+            snap.warnings.append("incidents table missing — run Phase 6 controller once.")
+
+        if _table_exists(conn, "proposals"):
+            snap.proposals_available = True
+            snap.proposals = []
+            for row in conn.execute("SELECT * FROM proposals ORDER BY updated_at DESC"):
+                item = dict(row)
+                item["changed_dims"] = _parse_json(item.get("changed_dims_json"))
+                item["proposed_config"] = _parse_json(item.get("proposed_config_json"))
+                item["diff"] = _parse_json(item.get("diff_json"))
+                item["dry_run"] = _parse_json(item.get("dry_run_json"))
+                item["evidence"] = _parse_json(item.get("evidence_json"))
+                snap.proposals.append(item)
+            pending = [p for p in snap.proposals if p.get("status") in {"draft", "submitted", "approved"}]
+            if pending:
+                snap.warnings.append(f"{len(pending)} proposal(s) pending approval or apply.")
+            if not snap.proposals:
+                snap.warnings.append("No controller proposals yet (no winners promoted or governance not run).")
+        else:
+            snap.proposals_available = False
+            snap.warnings.append("proposals table missing — run Phase 6 controller once.")
+
+        if _table_exists(conn, "controller_approvals"):
+            snap.approvals_available = True
+            snap.controller_approvals = []
+            for row in conn.execute("SELECT * FROM controller_approvals ORDER BY updated_at DESC"):
+                item = dict(row)
+                item["changed_dims"] = _parse_json(item.get("changed_dims_json"))
+                item["reasons"] = _parse_json(item.get("reasons_json"))
+                item["raw"] = _parse_json(item.get("raw_json"))
+                snap.controller_approvals.append(item)
+            if not snap.controller_approvals:
+                snap.warnings.append("No controller-tracked approvals yet.")
+        else:
+            snap.approvals_available = False
+            snap.warnings.append("controller_approvals table missing — run Phase 6 controller once.")
+
+        if _table_exists(conn, "audit_decisions"):
+            snap.audit_available = True
+            snap.audit_decisions = []
+            for row in conn.execute("SELECT * FROM audit_decisions ORDER BY wall_ts DESC LIMIT 100"):
+                item = dict(row)
+                item["details"] = _parse_json(item.get("details_json"))
+                snap.audit_decisions.append(item)
+            if not snap.audit_decisions:
+                snap.warnings.append("Audit table present but empty.")
+        else:
+            snap.audit_available = False
+            snap.warnings.append("audit_decisions table missing — run Phase 6 controller once.")
 
         if snap.counts.get("events", 0) == 0:
             snap.warnings.append("No events ingested yet.")
@@ -249,7 +321,7 @@ def load_snapshot(db_path: str | Path, *, simulator: dict[str, Any] | None = Non
             snap.warnings.append("Events exist but projection cursor is missing — joins may be incomplete.")
 
         snap.ok = True
-    except Exception as exc:  # noqa: BLE001 — surface any DB problem to the UI
+    except Exception as exc:  # noqa: BLE001
         snap.errors.append(str(exc))
         snap.ok = False
     finally:

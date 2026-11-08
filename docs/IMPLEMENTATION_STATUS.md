@@ -1,14 +1,14 @@
 # Implementation status
 
-Phases 0–5 are done. Phase 5 adds observational welcome/voice experiments, deterministic statistical winner selection, and dashboard experiment panels. Phase 6 (governance apply / promotion) has not started.
+Phases 0–6 are done. Phase 6 adds incidents, governed proposals/approvals/apply, decay-aware rollback proposals, audit, and dashboard panels for those stores. Phase 7 (prompt LLM/validation incident loop) has not started.
 
 Per-phase details:
 
-- `docs/IMPLEMENTATION_STATUS_PHASE1.md` … `PHASE4.md`
-- `docs/IMPLEMENTATION_STATUS_PHASE5.md` — experiments + stats + dashboard
+- `docs/IMPLEMENTATION_STATUS_PHASE1.md` … `PHASE5.md`
+- `docs/IMPLEMENTATION_STATUS_PHASE6.md` — incidents + governance + audit + dashboard
 - `docs/DASHBOARD.md` — read-only monitor
 
-Checked on 8 Nov 2026 with `.venv` Python 3.11.9. Full suite: `68 passed, 1 skipped`.
+Checked on 8 Nov 2026 with `.venv` Python 3.11.9. Full suite: `78 passed, 1 skipped`.
 
 ## Repository inventory
 

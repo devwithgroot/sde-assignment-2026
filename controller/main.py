@@ -15,8 +15,11 @@ from dataclasses import dataclass
 from controller.api.client import SimulatorClient, SimulatorError
 from controller.api.models import ChunkMeta, SimState, Workflow, WorkflowConfig
 from controller.persistence.repositories import IngestIntegrityError, Store
+from controller.services.decay import detect_promoted_decay
 from controller.services.detector import detect_all
 from controller.services.experiments import run_all_experiments
+from controller.services.governance import GovernanceReport, run_governance_cycle
+from controller.services.incidents import link_incident_experiment, sync_incidents_from_signals
 from controller.services.ingestion import ingest_available
 from controller.services.joiner import WorkflowConfigRef, project_events
 from controller.services.metrics import compute_and_store_workflow_views
@@ -102,20 +105,34 @@ def observe(client: SimulatorClient) -> Observation:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Observe the simulator without changing it.")
+    parser = argparse.ArgumentParser(
+        description="Controller loop: ingest, measure, experiment, then governed config changes."
+    )
     parser.add_argument("--url", default=None, help="Simulator base URL. Falls back to SIM_URL.")
     parser.add_argument("--db", default=None, help="SQLite path. Falls back to CONTROLLER_DB or data/controller.sqlite.")
+    parser.add_argument(
+        "--no-governance",
+        action="store_true",
+        help="Skip proposal/approval/apply (observe + local incident/experiment analysis only).",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        settings = Settings.from_env(args.url, db_path=args.db)
+        settings = Settings.from_env(
+            args.url,
+            db_path=args.db,
+            governance_enabled=False if args.no_governance else None,
+        )
     except ValueError as exc:
         print(f"usage: python -m controller.main --url <SIM_URL>\n{exc}", file=sys.stderr)
         return 2
     configure_logging(settings.log_level)
+    governance_report = GovernanceReport(notes=["governance not run"])
+    incidents: list = []
+    decay_hits: list = []
     try:
         with SimulatorClient(
             settings.sim_url,
@@ -148,6 +165,26 @@ def main(argv: list[str] | None = None) -> int:
                 kpi_slices = compute_and_store_workflow_views(store, workflow_ids)
                 signals = detect_all(store, workflow_ids)
                 experiments = run_all_experiments(store, report.workflows, report.configs)
+                tenants = {w.workflow_id: w.tenant_id for w in report.workflows}
+                incidents = sync_incidents_from_signals(store, signals, tenant_by_workflow=tenants)
+                for exp in experiments:
+                    for incident in incidents:
+                        if incident.workflow_id == exp.workflow_id and incident.status in {
+                            "detected",
+                            "investigating",
+                            "mitigating",
+                        }:
+                            link_incident_experiment(store, incident.incident_id, exp.experiment_id)
+                decay_hits = detect_promoted_decay(store)
+                governance_report = run_governance_cycle(
+                    client,
+                    store,
+                    report.workflows,
+                    report.configs,
+                    experiments,
+                    decay_hits=decay_hits,
+                    mutate=settings.governance_enabled,
+                )
             finally:
                 store.close()
     except (SimulatorError, IngestIntegrityError) as exc:
@@ -197,7 +234,8 @@ def main(argv: list[str] | None = None) -> int:
     for exp in experiments:
         print(
             f"  experiment {exp.experiment_id} status={exp.status} decision={exp.decision} "
-            f"winner={exp.winner_variant or '-'} reason={exp.decision_reason}"
+            f"winner={exp.winner_variant or '-'} promotion={exp.promotion_status or '-'} "
+            f"reason={exp.decision_reason}"
         )
         for arm in exp.arms:
             rate = "n/a" if arm.primary_rate is None else f"{arm.primary_rate:.4f}"
@@ -207,6 +245,24 @@ def main(argv: list[str] | None = None) -> int:
                 f"primary={rate} verdict={arm.verdict or '-'} "
                 f"p={arm.p_value if arm.p_value is not None else 'n/a'}"
             )
+    print(f"incidents={len(incidents)}")
+    for incident in incidents:
+        print(
+            f"  incident {incident.incident_id} {incident.workflow_id} "
+            f"status={incident.status} severity={incident.severity} type={incident.signal_type}"
+        )
+    print(f"decay_hits={len(decay_hits)}")
+    for hit in decay_hits:
+        print(f"  decay {hit.get('workflow_id')} {hit.get('reason')}")
+    print(
+        f"governance mutate={str(settings.governance_enabled).lower()} "
+        f"proposals={governance_report.proposals_built} submitted={governance_report.proposals_submitted} "
+        f"auto_applied={governance_report.auto_applied} applied={governance_report.applied} "
+        f"reconciled={governance_report.approvals_reconciled} "
+        f"rollbacks={governance_report.rollbacks_proposed}"
+    )
+    for note in governance_report.notes:
+        print(f"  governance_note {note}")
     for workflow, config in zip(report.workflows, report.configs, strict=True):
         print(
             f"  {workflow.workflow_id} version={config.version} primary={workflow.objective.primary} "

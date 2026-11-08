@@ -265,9 +265,103 @@ CREATE INDEX IF NOT EXISTS idx_experiments_workflow ON experiments(workflow_id, 
 CREATE INDEX IF NOT EXISTS idx_experiment_arms_exp ON experiment_arms(experiment_id);
 CREATE INDEX IF NOT EXISTS idx_calls_voice ON calls(voice);
 CREATE INDEX IF NOT EXISTS idx_calls_welcome ON calls(welcome_message);
+
+CREATE TABLE IF NOT EXISTS incidents (
+    incident_id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL,
+    tenant_id TEXT,
+    signal_fingerprint TEXT NOT NULL UNIQUE,
+    signal_type TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    status TEXT NOT NULL,
+    title TEXT NOT NULL,
+    message TEXT,
+    evidence_json TEXT NOT NULL,
+    related_experiment_id TEXT,
+    related_proposal_id TEXT,
+    resolution TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    closed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS proposals (
+    proposal_id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL,
+    base_version INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_ref TEXT,
+    changed_dims_json TEXT NOT NULL,
+    proposed_config_json TEXT NOT NULL,
+    change_summary TEXT NOT NULL,
+    diff_json TEXT NOT NULL,
+    dry_run_json TEXT NOT NULL,
+    impact_score REAL NOT NULL,
+    affected_leads INTEGER NOT NULL,
+    rationale TEXT NOT NULL,
+    evidence_json TEXT,
+    approval_id TEXT,
+    route TEXT,
+    error_code TEXT,
+    error_detail TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    submitted_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS controller_approvals (
+    approval_id TEXT PRIMARY KEY,
+    proposal_id TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    base_version INTEGER,
+    changed_dims_json TEXT,
+    created_at TEXT,
+    updated_at TEXT NOT NULL,
+    expires_at TEXT,
+    apply_by TEXT,
+    decided_at TEXT,
+    reasons_json TEXT,
+    applied_version INTEGER,
+    last_reconciled_at TEXT,
+    raw_json TEXT
+);
+
+CREATE TABLE IF NOT EXISTS audit_decisions (
+    decision_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    workflow_id TEXT,
+    tenant_id TEXT,
+    cohort_id TEXT,
+    related_incident_id TEXT,
+    related_proposal_id TEXT,
+    related_approval_id TEXT,
+    related_experiment_id TEXT,
+    sim_ts TEXT,
+    wall_ts TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    details_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS config_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    config_json TEXT NOT NULL,
+    source TEXT NOT NULL,
+    related_proposal_id TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(workflow_id, version, source)
+);
+
+CREATE INDEX IF NOT EXISTS idx_incidents_workflow ON incidents(workflow_id, status);
+CREATE INDEX IF NOT EXISTS idx_proposals_workflow ON proposals(workflow_id, status);
+CREATE INDEX IF NOT EXISTS idx_controller_approvals_workflow ON controller_approvals(workflow_id, status);
+CREATE INDEX IF NOT EXISTS idx_audit_decisions_workflow ON audit_decisions(workflow_id, wall_ts);
 """
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def connect(path: Path) -> sqlite3.Connection:
