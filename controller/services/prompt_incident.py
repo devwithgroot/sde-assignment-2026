@@ -18,6 +18,8 @@ from controller.api.models import SimState, Workflow, WorkflowConfig
 from controller.persistence.repositories import Store
 from controller.services.audit import audit
 from controller.services.change_builder import build_prompt_proposal
+from controller.services.credits import CreditBudget
+from controller.services.fairness import ACTION_PROMPT_INCIDENT, FairScheduler
 from controller.services.governance import submit_proposal
 from controller.services.incidents import (
     Incident,
@@ -25,6 +27,7 @@ from controller.services.incidents import (
     resolve_incident,
     _row_to_incident,
 )
+from controller.services.observability import bump_counter
 
 HALLUCINATION_SIGNAL = "hallucination_spike"
 DEFAULT_VALIDATION_N = 200
@@ -282,6 +285,8 @@ def run_prompt_incident_cycle(
     *,
     mutate: bool = True,
     validation_n: int = DEFAULT_VALIDATION_N,
+    credit_budget: CreditBudget | None = None,
+    scheduler: FairScheduler | None = None,
 ) -> PromptIncidentReport:
     report = PromptIncidentReport()
     by_wf = {w.workflow_id: w for w in workflows}
@@ -294,6 +299,14 @@ def run_prompt_incident_cycle(
             "(no LLM, validation, or proposal submit)"
         )
         return report
+
+    budget = credit_budget or CreditBudget(store)
+    budget.refresh_from_sim(float(state.credits_remaining))
+    sched = scheduler or FairScheduler(store)
+    if workflows:
+        ordered = sched.order_workflows(workflows, action_kind=ACTION_PROMPT_INCIDENT)
+        order_index = {w.workflow_id: i for i, w in enumerate(ordered)}
+        eligible.sort(key=lambda inc: (order_index.get(inc.workflow_id, 10_000), inc.incident_id))
 
     _resume_proposed_attempts(client, store, workflows, report)
 
@@ -323,8 +336,19 @@ def run_prompt_incident_cycle(
         if not problem:
             problem = f"hallucination incident {incident.incident_id}"
 
-        if credits < SUGGEST_CREDIT_COST:
+        spend = budget.can_spend(
+            SUGGEST_CREDIT_COST, purpose="emergency_prompt", sim_credits=credits
+        )
+        if not spend.allowed or credits < SUGGEST_CREDIT_COST:
             report.credit_blocked += 1
+            reason = spend.reason if not spend.allowed else f"need {SUGGEST_CREDIT_COST}, have {credits}"
+            sched.record_deferral(
+                workflow_id=incident.workflow_id,
+                tenant_id=workflow.tenant_id,
+                action_kind=ACTION_PROMPT_INCIDENT,
+                priority=90,
+                reason=reason,
+            )
             attempt = LlmAttempt(
                 attempt_id=attempt_id,
                 incident_id=incident.incident_id,
@@ -333,16 +357,17 @@ def run_prompt_incident_cycle(
                 problem=problem,
                 credits_before=credits,
                 error_code="insufficient_credits",
-                error_detail=f"need {SUGGEST_CREDIT_COST}, have {credits}",
+                error_detail=reason,
                 created_at=_now(),
                 updated_at=_now(),
             )
             store.upsert_llm_attempt(attempt)
+            bump_counter(store, "prompt.credit_blocked")
             audit(
                 store,
                 kind="llm_suggest_blocked_credits",
-                summary=f"Skipped suggest-fixes for {incident.incident_id}: credits={credits}",
-                details={"credits": credits, "need": SUGGEST_CREDIT_COST},
+                summary=f"Skipped suggest-fixes for {incident.incident_id}: {reason}",
+                details={"credits": credits, "need": SUGGEST_CREDIT_COST, "decision": spend.reason},
                 workflow_id=incident.workflow_id,
                 related_incident_id=incident.incident_id,
                 idempotency_parts=[attempt_id, "credit_block"],
@@ -397,6 +422,8 @@ def run_prompt_incident_cycle(
                 credits = max(0.0, credits - SUGGEST_CREDIT_COST)
         else:
             credits = max(0.0, credits - SUGGEST_CREDIT_COST)
+        budget.record_spend(SUGGEST_CREDIT_COST, pool="emergency", sim_credits_after=credits)
+        bump_counter(store, "prompt.llm_suggest")
 
         allowed = set(workflow.options.prompt_version or [])
         suggestions = _parse_suggestions(payload, allowed)
@@ -562,6 +589,8 @@ def run_prompt_incident_cycle(
             store.upsert_validation_record(rec)
             val_records.append(rec)
             report.validated += 1
+            budget.record_spend(cost, pool="emergency", sim_credits_after=credits)
+            bump_counter(store, "prompt.validation")
 
         chosen = select_validated_candidate(val_records, min_pass_rate=min_rate)
         if chosen is None:

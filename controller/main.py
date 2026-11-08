@@ -15,14 +15,17 @@ from dataclasses import dataclass
 from controller.api.client import SimulatorClient, SimulatorError
 from controller.api.models import ChunkMeta, SimState, Workflow, WorkflowConfig
 from controller.persistence.repositories import IngestIntegrityError, Store
+from controller.services.credits import CreditBudget
 from controller.services.decay import detect_promoted_decay
 from controller.services.detector import detect_all
 from controller.services.experiments import run_all_experiments
+from controller.services.fairness import ACTION_GOVERNANCE, ACTION_PROMPT_INCIDENT, FairScheduler
 from controller.services.governance import GovernanceReport, run_governance_cycle
 from controller.services.incidents import link_incident_experiment, sync_incidents_from_signals
 from controller.services.ingestion import ingest_available
 from controller.services.joiner import WorkflowConfigRef, project_events
 from controller.services.metrics import compute_and_store_workflow_views
+from controller.services.observability import build_supervisor_summary, bump_counter, summary_as_dict
 from controller.services.prompt_incident import PromptIncidentReport, run_prompt_incident_cycle
 from controller.settings import Settings
 
@@ -133,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging(settings.log_level)
     governance_report = GovernanceReport(notes=["governance not run"])
     prompt_report = PromptIncidentReport(notes=["prompt incident loop not run"])
+    supervisor = None
     incidents: list = []
     decay_hits: list = []
     try:
@@ -178,23 +182,47 @@ def main(argv: list[str] | None = None) -> int:
                         }:
                             link_incident_experiment(store, incident.incident_id, exp.experiment_id)
                 decay_hits = detect_promoted_decay(store)
+                credit_budget = CreditBudget(store)
+                credit_budget.refresh_from_sim(float(report.state.credits_remaining))
+                scheduler = FairScheduler(store)
+                scheduler.ensure_workflows(report.workflows)
+                prompt_workflows = scheduler.order_workflows(
+                    report.workflows, action_kind=ACTION_PROMPT_INCIDENT
+                )
                 prompt_report = run_prompt_incident_cycle(
                     client,
                     store,
-                    report.workflows,
+                    prompt_workflows,
                     report.configs,
                     report.state,
                     mutate=settings.governance_enabled,
+                    credit_budget=credit_budget,
+                    scheduler=scheduler,
                 )
+                gov_workflows = scheduler.order_workflows(
+                    report.workflows, action_kind=ACTION_GOVERNANCE
+                )
+                # Fairness: process experiment promotions in scheduler order.
+                exp_by_wf = {e.workflow_id: [] for e in experiments}
+                for e in experiments:
+                    exp_by_wf.setdefault(e.workflow_id, []).append(e)
+                ordered_experiments = []
+                for wf in gov_workflows:
+                    ordered_experiments.extend(exp_by_wf.get(wf.workflow_id, []))
+                for e in experiments:
+                    if e not in ordered_experiments:
+                        ordered_experiments.append(e)
                 governance_report = run_governance_cycle(
                     client,
                     store,
-                    report.workflows,
+                    gov_workflows,
                     report.configs,
-                    experiments,
+                    ordered_experiments,
                     decay_hits=decay_hits,
                     mutate=settings.governance_enabled,
                 )
+                bump_counter(store, "controller.cycles")
+                supervisor = build_supervisor_summary(store)
             finally:
                 store.close()
     except (SimulatorError, IngestIntegrityError) as exc:
@@ -282,6 +310,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     for note in governance_report.notes:
         print(f"  governance_note {note}")
+    if supervisor is not None:
+        print(
+            f"supervisor health={supervisor.health} incidents_open={supervisor.incidents_open} "
+            f"proposals_pending={supervisor.proposals_pending} "
+            f"approvals_pending={supervisor.approvals_pending} "
+            f"starvation={len(supervisor.starvation_workflows)} "
+            f"deferred={len(supervisor.deferred_open)}"
+        )
+        for note in supervisor.notes:
+            print(f"  supervisor_note {note}")
+        print(_line("supervisor_summary", **{k: v for k, v in summary_as_dict(supervisor).items() if k in {
+            "health", "incidents_open", "proposals_pending", "approvals_pending",
+            "actions_by_tenant", "credit_budget", "starvation_workflows",
+        }}))
     for workflow, config in zip(report.workflows, report.configs, strict=True):
         print(
             f"  {workflow.workflow_id} version={config.version} primary={workflow.objective.primary} "

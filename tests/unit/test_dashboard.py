@@ -285,11 +285,12 @@ def test_snapshot_phase5_without_fabricated_governance(tmp_path):
     assert snap.proposals_available is True
     assert snap.incidents == []
     assert snap.proposals == []
-    assert "fairness_scheduler" in {u["key"] for u in snap.unimplemented}
+    assert "public_scenario_grading" in {u["key"] for u in snap.unimplemented}
     html = render_html(snap)
     assert "Incidents" in html
     assert "No incident rows" in html or "empty" in html.lower()
     assert "LLM suggestion" in html
+    assert "Fairness" in html
 
 
 def test_snapshot_shows_real_phase6_rows(tmp_path):

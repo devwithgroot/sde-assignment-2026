@@ -353,6 +353,9 @@ def reconcile_approvals(client: SimulatorClient, store: Store) -> list[Controlle
             )
             continue
         approval = _approval_from_api(payload, proposal_id=row["proposal_id"])
+        if row["status"] == "applied" and approval.status != "applied":
+            # Keep terminal local apply; simulator poll may lag.
+            continue
         store.upsert_controller_approval(approval)
         _sync_proposal_status_from_approval(store, approval)
         updated.append(approval)
@@ -407,6 +410,9 @@ def reconcile_approvals(client: SimulatorClient, store: Store) -> list[Controlle
 def _sync_proposal_status_from_approval(store: Store, approval: ControllerApproval) -> None:
     prop = store.get_proposal(approval.proposal_id)
     if prop is None:
+        return
+    # Never downgrade a locally applied proposal when the poll still says approved.
+    if prop["status"] == "applied" and approval.status != "applied":
         return
     mapping = {
         "pending": "submitted",
@@ -566,6 +572,19 @@ def apply_approved(client: SimulatorClient, store: Store) -> list[dict[str, Any]
     return results
 
 
+def _approver_attention_ok(store: Store, workflow: Workflow) -> tuple[bool, str]:
+    """Local soft cap mirroring max_requests_per_24h to protect approver attention."""
+    cap = int(workflow.governance.max_requests_per_24h)
+    openish = [
+        p
+        for p in store.recent_proposals_for_workflow(workflow.workflow_id, limit=100)
+        if p["status"] in {"draft", "submitted", "approved"}
+    ]
+    if len(openish) >= cap:
+        return False, f"approver_attention_cap open={len(openish)} cap={cap}"
+    return True, "ok"
+
+
 def promote_experiment_winners(
     client: SimulatorClient,
     store: Store,
@@ -584,6 +603,18 @@ def promote_experiment_winners(
         workflow = by_wf.get(exp.workflow_id)
         config = by_cfg.get(exp.workflow_id)
         if workflow is None or config is None:
+            continue
+        ok_attn, attn_reason = _approver_attention_ok(store, workflow)
+        if not ok_attn:
+            from controller.services.fairness import ACTION_GOVERNANCE, FairScheduler
+
+            FairScheduler(store).record_deferral(
+                workflow_id=workflow.workflow_id,
+                tenant_id=workflow.tenant_id,
+                action_kind=ACTION_GOVERNANCE,
+                priority=10,
+                reason=attn_reason,
+            )
             continue
         # Refresh live config before proposing (avoid stale base).
         try:

@@ -256,6 +256,11 @@ class Store:
             "config_snapshots",
             "llm_suggestion_attempts",
             "validation_run_records",
+            "scheduler_state",
+            "deferred_actions",
+            "credit_budget_state",
+            "observability_counters",
+            "operational_alerts",
         }
         if table not in allowed:
             raise ValueError(table)
@@ -1092,6 +1097,185 @@ class Store:
                 ).fetchall()
             )
         return list(self.conn.execute("SELECT * FROM validation_run_records ORDER BY created_at DESC").fetchall())
+
+    def upsert_scheduler_state(
+        self,
+        *,
+        workflow_id: str,
+        tenant_id: str,
+        weight: float,
+        last_served_tick: int,
+        wait_ticks: int,
+        actions_taken: int,
+        last_action_kind: str | None,
+        updated_at: str,
+    ) -> None:
+        self.conn.execute(
+            """INSERT INTO scheduler_state (
+                   workflow_id, tenant_id, weight, last_served_tick, wait_ticks,
+                   actions_taken, last_action_kind, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(workflow_id) DO UPDATE SET
+                 tenant_id = excluded.tenant_id,
+                 weight = excluded.weight,
+                 last_served_tick = excluded.last_served_tick,
+                 wait_ticks = excluded.wait_ticks,
+                 actions_taken = excluded.actions_taken,
+                 last_action_kind = excluded.last_action_kind,
+                 updated_at = excluded.updated_at""",
+            (
+                workflow_id,
+                tenant_id,
+                weight,
+                last_served_tick,
+                wait_ticks,
+                actions_taken,
+                last_action_kind,
+                updated_at,
+            ),
+        )
+
+    def get_scheduler_state(self, workflow_id: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM scheduler_state WHERE workflow_id = ?", (workflow_id,)
+        ).fetchone()
+
+    def list_scheduler_state(self) -> list[sqlite3.Row]:
+        return list(self.conn.execute("SELECT * FROM scheduler_state ORDER BY workflow_id").fetchall())
+
+    def upsert_deferred_action(
+        self,
+        *,
+        defer_id: str,
+        workflow_id: str,
+        tenant_id: str | None,
+        action_kind: str,
+        priority: int,
+        reason: str,
+        status: str,
+        created_at: str,
+        updated_at: str,
+        resolved_at: str | None,
+    ) -> None:
+        self.conn.execute(
+            """INSERT INTO deferred_actions (
+                   defer_id, workflow_id, tenant_id, action_kind, priority, reason,
+                   status, created_at, updated_at, resolved_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(defer_id) DO UPDATE SET
+                 status = excluded.status,
+                 reason = excluded.reason,
+                 updated_at = excluded.updated_at,
+                 resolved_at = excluded.resolved_at""",
+            (
+                defer_id,
+                workflow_id,
+                tenant_id,
+                action_kind,
+                priority,
+                reason,
+                status,
+                created_at,
+                updated_at,
+                resolved_at,
+            ),
+        )
+
+    def list_deferred_actions(self, status: str | None = None) -> list[sqlite3.Row]:
+        if status is None:
+            return list(self.conn.execute("SELECT * FROM deferred_actions ORDER BY created_at DESC").fetchall())
+        return list(
+            self.conn.execute(
+                "SELECT * FROM deferred_actions WHERE status = ? ORDER BY created_at DESC", (status,)
+            ).fetchall()
+        )
+
+    def get_credit_budget(self) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM credit_budget_state WHERE id = 1").fetchone()
+
+    def upsert_credit_budget(
+        self,
+        *,
+        emergency_reserve: float,
+        experiment_budget_cap: float,
+        experiment_spent: float,
+        emergency_spent: float,
+        last_sim_credits: float | None,
+        updated_at: str,
+    ) -> None:
+        self.conn.execute(
+            """INSERT INTO credit_budget_state (
+                   id, emergency_reserve, experiment_budget_cap, experiment_spent,
+                   emergency_spent, last_sim_credits, updated_at
+               ) VALUES (1, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                 emergency_reserve = excluded.emergency_reserve,
+                 experiment_budget_cap = excluded.experiment_budget_cap,
+                 experiment_spent = excluded.experiment_spent,
+                 emergency_spent = excluded.emergency_spent,
+                 last_sim_credits = excluded.last_sim_credits,
+                 updated_at = excluded.updated_at""",
+            (
+                emergency_reserve,
+                experiment_budget_cap,
+                experiment_spent,
+                emergency_spent,
+                last_sim_credits,
+                updated_at,
+            ),
+        )
+
+    def bump_observability_counter(self, name: str, delta: float = 1.0) -> None:
+        now = _now()
+        self.conn.execute(
+            """INSERT INTO observability_counters (name, value, updated_at) VALUES (?, ?, ?)
+               ON CONFLICT(name) DO UPDATE SET
+                 value = value + excluded.value,
+                 updated_at = excluded.updated_at""",
+            (name, delta, now),
+        )
+
+    def list_observability_counters(self) -> list[sqlite3.Row]:
+        return list(self.conn.execute("SELECT * FROM observability_counters ORDER BY name").fetchall())
+
+    def insert_operational_alert(
+        self,
+        *,
+        alert_id: str,
+        kind: str,
+        severity: str,
+        workflow_id: str | None,
+        message: str,
+        details: dict,
+        created_at: str,
+    ) -> bool:
+        before = self.conn.total_changes
+        self.conn.execute(
+            """INSERT INTO operational_alerts (
+                   alert_id, kind, severity, workflow_id, message, details_json, created_at, suppressed
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+               ON CONFLICT(alert_id) DO NOTHING""",
+            (alert_id, kind, severity, workflow_id, message, json.dumps(details, sort_keys=True), created_at),
+        )
+        return self.conn.total_changes > before
+
+    def list_operational_alerts(self, limit: int = 50) -> list[sqlite3.Row]:
+        return list(
+            self.conn.execute(
+                """SELECT * FROM operational_alerts WHERE suppressed = 0
+                   ORDER BY created_at DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        )
+
+    def recent_proposals_for_workflow(self, workflow_id: str, *, limit: int = 50) -> list[sqlite3.Row]:
+        return list(
+            self.conn.execute(
+                """SELECT * FROM proposals WHERE workflow_id = ?
+                   ORDER BY created_at DESC LIMIT ?""",
+                (workflow_id, limit),
+            ).fetchall()
+        )
 
 
 class _Transaction:

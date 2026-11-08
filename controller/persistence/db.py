@@ -403,9 +403,63 @@ CREATE TABLE IF NOT EXISTS validation_run_records (
 CREATE INDEX IF NOT EXISTS idx_llm_attempts_incident ON llm_suggestion_attempts(incident_id, status);
 CREATE INDEX IF NOT EXISTS idx_validation_records_attempt ON validation_run_records(attempt_id);
 CREATE INDEX IF NOT EXISTS idx_validation_records_incident ON validation_run_records(incident_id);
+
+CREATE TABLE IF NOT EXISTS scheduler_state (
+    workflow_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    weight REAL NOT NULL DEFAULT 1.0,
+    last_served_tick INTEGER NOT NULL DEFAULT -1,
+    wait_ticks INTEGER NOT NULL DEFAULT 0,
+    actions_taken INTEGER NOT NULL DEFAULT 0,
+    last_action_kind TEXT,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS deferred_actions (
+    defer_id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL,
+    tenant_id TEXT,
+    action_kind TEXT NOT NULL,
+    priority INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS credit_budget_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    emergency_reserve REAL NOT NULL,
+    experiment_budget_cap REAL NOT NULL,
+    experiment_spent REAL NOT NULL DEFAULT 0,
+    emergency_spent REAL NOT NULL DEFAULT 0,
+    last_sim_credits REAL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS observability_counters (
+    name TEXT PRIMARY KEY,
+    value REAL NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS operational_alerts (
+    alert_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    workflow_id TEXT,
+    message TEXT NOT NULL,
+    details_json TEXT,
+    created_at TEXT NOT NULL,
+    suppressed INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_deferred_actions_status ON deferred_actions(status, workflow_id);
+CREATE INDEX IF NOT EXISTS idx_operational_alerts_kind ON operational_alerts(kind, created_at);
 """
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def connect(path: Path) -> sqlite3.Connection:

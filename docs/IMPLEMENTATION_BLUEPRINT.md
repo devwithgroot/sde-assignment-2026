@@ -1042,7 +1042,7 @@ Cursor/user must verify every item and mark evidence:
 - [ ] Audit query answers why/when/who/evidence/after-effect
 - [ ] public_01 and public_02 run unattended and graded
 - [ ] public_03 numbers measured
-- [ ] crash/restart evidence included
+- [x] crash/restart evidence included (Phase 8: mocked unit recovery + `python -m controller.recovery`; live kill test still optional)
 - [ ] stakeholder memos 01–06 covered
 - [ ] SUBMISSION.md headings all retained and complete
 - [ ] Known weaknesses and cuts honest

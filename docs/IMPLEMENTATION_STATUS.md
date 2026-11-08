@@ -1,14 +1,14 @@
 # Implementation status
 
-Phases 0–7 are done. Phase 7 adds hallucination incident remediation via untrusted LLM suggest-fixes, validation runs, and governed prompt proposals. Phase 8 has not started.
+Phases 0–8 are done. Phase 8 adds fair scheduling, credit reserves, observability/supervisor summary, and crash-recovery reconciliation. Phase 9 (public grading/submission) has not started.
 
 Per-phase details:
 
-- `docs/IMPLEMENTATION_STATUS_PHASE1.md` … `PHASE6.md`
-- `docs/IMPLEMENTATION_STATUS_PHASE7.md` — LLM suggest-fixes + validation + prompt proposals
+- `docs/IMPLEMENTATION_STATUS_PHASE1.md` … `PHASE7.md`
+- `docs/IMPLEMENTATION_STATUS_PHASE8.md` — fairness + observability + crash recovery
 - `docs/DASHBOARD.md` — read-only monitor
 
-Checked on 8 Nov 2026 with `.venv` Python 3.11.9. Full suite: `86 passed` (live ingest skips when simulator is down).
+Checked on 8 Nov 2026 with `.venv` Python 3.11.9. Full suite: `94 passed`.
 
 ## Repository inventory
 

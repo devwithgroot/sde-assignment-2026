@@ -40,7 +40,8 @@ JSON snapshot: [http://127.0.0.1:8800/api/snapshot](http://127.0.0.1:8800/api/sn
 - **Audit decisions** — controller action history
 - **LLM suggestion attempts** — status, selected prompt, validation id, linked proposal (suggestions are untrusted)
 - **Validation runs** — pass_rate, threshold meet/fail, errors
-- Explicit **not implemented yet** for Phase 8+ (fairness scheduler UI)
+- **Fairness & observability** — scheduler waits/actions, deferred reasons, credit reserves, alerts, counters
+- Explicit **not implemented yet** for Phase 9 grading/submission UI
 
 ## Insufficient / unavailable data
 

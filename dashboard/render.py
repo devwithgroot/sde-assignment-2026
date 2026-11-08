@@ -337,6 +337,62 @@ def render_html(snap: DashboardSnapshot) -> str:
     else:
         validation_block = """<p class="warn">Validation records unavailable.</p>"""
 
+    sched_rows = [
+        [
+            escape(str(r.get("workflow_id"))),
+            escape(str(r.get("tenant_id"))),
+            _fmt_rate(r.get("weight")),
+            _fmt_int(r.get("wait_ticks")),
+            _fmt_int(r.get("actions_taken")),
+            escape(str(r.get("last_action_kind") or "-")),
+            _fmt_int(r.get("last_served_tick")),
+        ]
+        for r in snap.scheduler_state
+    ]
+    defer_rows = [
+        [
+            escape(str(r.get("defer_id"))),
+            escape(str(r.get("workflow_id"))),
+            escape(str(r.get("action_kind"))),
+            _fmt_int(r.get("priority")),
+            escape(str(r.get("reason") or "")[:140]),
+            escape(str(r.get("status"))),
+        ]
+        for r in snap.deferred_actions
+    ]
+    alert_rows = [
+        [
+            escape(str(r.get("kind"))),
+            escape(str(r.get("severity"))),
+            escape(str(r.get("workflow_id") or "-")),
+            escape(str(r.get("message") or "")[:160]),
+            escape(str(r.get("created_at") or "")),
+        ]
+        for r in snap.operational_alerts
+    ]
+    counter_rows = [[escape(k), _fmt_rate(v) if isinstance(v, float) and v != int(v) else _fmt_int(v)] for k, v in sorted(snap.observability_counters.items())]
+    if snap.fairness_available:
+        cb = snap.credit_budget or {}
+        fairness_block = f"""
+      <p class="note">Fair scheduler + credit reserves. Dashboard is read-only and cannot spend credits or submit proposals.</p>
+      <h3>Credit budget</h3>
+      <p>sim_credits=<code>{escape(str(cb.get('last_sim_credits', 'n/a')))}</code>
+         emergency_reserve=<code>{escape(str(cb.get('emergency_reserve', 'n/a')))}</code>
+         experiment_spent=<code>{escape(str(cb.get('experiment_spent', 'n/a')))}</code>
+         emergency_spent=<code>{escape(str(cb.get('emergency_spent', 'n/a')))}</code>
+         experiment_cap=<code>{escape(str(cb.get('experiment_budget_cap', 'n/a')))}</code></p>
+      <h3>Scheduler state</h3>
+      {_rows(["workflow", "tenant", "weight", "wait", "actions", "last_kind", "last_tick"], sched_rows)}
+      <h3>Deferred actions</h3>
+      {_rows(["id", "workflow", "kind", "priority", "reason", "status"], defer_rows) if defer_rows else "<p class='warn'>No deferred actions.</p>"}
+      <h3>Operational alerts</h3>
+      {_rows(["kind", "severity", "workflow", "message", "created"], alert_rows) if alert_rows else "<p class='warn'>No alerts.</p>"}
+      <h3>Counters</h3>
+      {_rows(["name", "value"], counter_rows) if counter_rows else "<p class='warn'>No counters yet.</p>"}
+"""
+    else:
+        fairness_block = """<p class="warn">Fairness/observability tables unavailable. Run Phase 8 controller once.</p>"""
+
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -500,9 +556,13 @@ def render_html(snap: DashboardSnapshot) -> str:
       {validation_block}
     </section>
     <section>
+      <h2>Fairness &amp; observability</h2>
+      {fairness_block}
+    </section>
+    <section>
       <h2>Not implemented yet</h2>
       {_rows(["area", "detail", "status"], unimplemented_rows)}
-      <p class="note">Phase 8+ surfaces (fairness scheduler UI) remain unavailable.</p>
+      <p class="note">Phase 9 grading/submission surfaces remain unavailable.</p>
     </section>
   </main>
 </body>

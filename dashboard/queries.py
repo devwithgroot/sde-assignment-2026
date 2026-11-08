@@ -16,7 +16,7 @@ from controller.persistence.db import connect, init_schema
 
 
 UNIMPLEMENTED = (
-    ("fairness_scheduler", "Tenant/workflow fair scheduler and credit reserve policy UI (Phase 8)"),
+    ("public_scenario_grading", "Public scenario grading / submission pack UI (Phase 9)"),
 )
 
 
@@ -52,6 +52,13 @@ class DashboardSnapshot:
     llm_attempts_available: bool = False
     validation_records: list[dict[str, Any]] = field(default_factory=list)
     validation_available: bool = False
+    scheduler_state: list[dict[str, Any]] = field(default_factory=list)
+    deferred_actions: list[dict[str, Any]] = field(default_factory=list)
+    credit_budget: dict[str, Any] | None = None
+    operational_alerts: list[dict[str, Any]] = field(default_factory=list)
+    observability_counters: dict[str, float] = field(default_factory=dict)
+    supervisor_summary: dict[str, Any] | None = None
+    fairness_available: bool = False
     unimplemented: list[dict[str, str]] = field(default_factory=list)
     simulator: dict[str, Any] | None = None
 
@@ -124,6 +131,11 @@ def load_snapshot(db_path: str | Path, *, simulator: dict[str, Any] | None = Non
             "config_snapshots",
             "llm_suggestion_attempts",
             "validation_run_records",
+            "scheduler_state",
+            "deferred_actions",
+            "credit_budget_state",
+            "operational_alerts",
+            "observability_counters",
         ):
             snap.counts[table] = _count(conn, table)
 
@@ -350,6 +362,53 @@ def load_snapshot(db_path: str | Path, *, simulator: dict[str, Any] | None = Non
         else:
             snap.validation_available = False
             snap.warnings.append("validation_run_records missing — run Phase 7 controller once.")
+
+        if _table_exists(conn, "scheduler_state"):
+            snap.fairness_available = True
+            snap.scheduler_state = [dict(r) for r in conn.execute("SELECT * FROM scheduler_state ORDER BY workflow_id")]
+            if _table_exists(conn, "deferred_actions"):
+                snap.deferred_actions = [
+                    dict(r)
+                    for r in conn.execute(
+                        """SELECT * FROM deferred_actions WHERE status = 'deferred'
+                           ORDER BY created_at DESC LIMIT 100"""
+                    )
+                ]
+            if _table_exists(conn, "credit_budget_state"):
+                row = conn.execute("SELECT * FROM credit_budget_state WHERE id = 1").fetchone()
+                snap.credit_budget = dict(row) if row else None
+            if _table_exists(conn, "operational_alerts"):
+                snap.operational_alerts = [
+                    dict(r)
+                    for r in conn.execute(
+                        """SELECT * FROM operational_alerts WHERE suppressed = 0
+                           ORDER BY created_at DESC LIMIT 50"""
+                    )
+                ]
+            if _table_exists(conn, "observability_counters"):
+                snap.observability_counters = {
+                    r["name"]: float(r["value"])
+                    for r in conn.execute("SELECT name, value FROM observability_counters ORDER BY name")
+                }
+            # Lightweight supervisor view from already-loaded rows (no Store writes from dashboard).
+            starvation = [r["workflow_id"] for r in snap.scheduler_state if int(r.get("wait_ticks") or 0) >= 20]
+            snap.supervisor_summary = {
+                "fairness_available": True,
+                "actions_by_workflow": {r["workflow_id"]: r.get("actions_taken") for r in snap.scheduler_state},
+                "wait_ticks_by_workflow": {r["workflow_id"]: r.get("wait_ticks") for r in snap.scheduler_state},
+                "starvation_workflows": starvation,
+                "deferred_open": len(snap.deferred_actions),
+                "credit_budget": snap.credit_budget,
+                "alerts": len(snap.operational_alerts),
+                "counters": snap.observability_counters,
+            }
+            if starvation:
+                snap.warnings.append(f"Scheduler starvation indicators: {starvation}")
+            if snap.deferred_actions:
+                snap.warnings.append(f"{len(snap.deferred_actions)} deferred action(s) pending.")
+        else:
+            snap.fairness_available = False
+            snap.warnings.append("scheduler_state missing — run Phase 8 controller once.")
 
         if snap.counts.get("events", 0) == 0:
             snap.warnings.append("No events ingested yet.")
