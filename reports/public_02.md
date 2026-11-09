@@ -4,38 +4,42 @@
 
 | workflow | conclusion rate | Δ | pickup | Δ | engagement | Δ | engagement gap captured | hallucinated calls (base) |
 |---|---|---|---|---|---|---|---|---|
-| ks_cancel | 0.245 | -1.1% | 0.182 | -0.9% | 0.478 | +0.3% | 8% | 334 (330) |
-| nw_kyc | 0.358 | -4.4% | 0.239 | -1.4% | 0.582 | -1.7% | -46% | 25 (31) |
-| nw_renewal | 0.424 | -0.6% | 0.262 | +0.1% | 0.545 | -0.5% | 2% | 56 (55) |
-| ALL | 0.329 | -1.7% | 0.221 | -0.6% | 0.527 | -0.5% | -1% | 415 (416) |
+| ks_cancel | 0.259 | +4.4% | 0.181 | -1.7% | 0.507 | +6.3% | 34% | 84 (330) |
+| nw_kyc | 0.357 | -4.7% | 0.238 | -1.7% | 0.573 | -3.2% | -46% | 42 (31) |
+| nw_renewal | 0.434 | +1.8% | 0.265 | +1.1% | 0.551 | +0.6% | 10% | 57 (55) |
+| ALL | 0.338 | +1.2% | 0.221 | -0.6% | 0.539 | +1.7% | 15% | 183 (416) |
 
 ## Changes applied by the controller
 
-4 applied — harmful: 1, beneficial: 3
+8 applied — harmful: 2, beneficial: 6
 
 - nw_kyc v2 (controller_approved) dims=['welcome_message'] engageΔ=-0.040 didΔ=+0.000 → **harmful**
 - ks_cancel v2 (controller_approved) dims=['welcome_message'] engageΔ=+0.016 didΔ=+0.000 → **beneficial**
 - nw_renewal v2 (controller_approved) dims=['welcome_message'] engageΔ=+0.059 didΔ=+0.000 → **beneficial**
 - nw_renewal v3 (controller_approved) dims=['welcome_message'] engageΔ=+0.036 didΔ=+0.000 → **beneficial**
+- ks_cancel v3 (controller_approved) dims=['welcome_message'] engageΔ=+0.010 didΔ=+0.000 → **beneficial**
+- ks_cancel v4 (controller_approved) dims=['welcome_message'] engageΔ=-0.010 didΔ=+0.000 → **harmful**
+- ks_cancel v6 (controller_approved) dims=['prompt_version'] engageΔ=+0.102 didΔ=+0.000 → **beneficial**
+- nw_renewal v4 (controller_approved) dims=['welcome_message'] engageΔ=+0.023 didΔ=+0.000 → **beneficial**
 
 ## Governance
 
 ```
 {
-  "approval_requests": 10,
+  "approval_requests": 9,
   "decisions": {
-    "approved": 10,
-    "expired": 0
+    "approved": 8,
+    "expired": 1
   },
   "rejection_reasons": {},
-  "applied_via_approval": 4,
+  "applied_via_approval": 8,
   "auto_applied": 0,
   "auto_apply_rejected": 0,
   "apply_conflicts": 0,
-  "lapsed": 6,
+  "lapsed": 0,
   "peak_requests_per_24h": {
     "nw_renewal": 2,
-    "ks_cancel": 1,
+    "ks_cancel": 2,
     "nw_kyc": 1
   }
 }
@@ -50,22 +54,22 @@
     "workflow": "ks_cancel",
     "at": "D2 10:00",
     "flagged_did_share_by_day": {
-      "2": 0.497,
-      "3": 0.494,
-      "4": 0.5,
-      "5": 0.504,
-      "6": 0.517,
-      "7": 0.496,
-      "8": 0.494,
-      "9": 0.494
+      "2": 0.493,
+      "3": 0.513,
+      "4": 0.49,
+      "5": 0.498,
+      "6": 0.503,
+      "7": 0.511,
+      "8": 0.517,
+      "9": 0.509
     }
   },
   {
     "type": "supervisor_edit",
     "workflow": "ks_cancel",
     "at": "D3 11:30",
-    "mttr_minutes": null,
-    "fixed_by": null
+    "mttr_minutes": 1455,
+    "fixed_by": "controller_approved"
   },
   {
     "type": "supervisor_edit",
@@ -80,16 +84,16 @@
 ```
 {
   "nw_renewal:welcome_message=W3": {
-    "2": 0.535,
-    "3": 0.561,
-    "4": 0.544,
-    "5": 0.551,
-    "6": 0.554,
-    "7": 0.554,
-    "8": 0.548,
-    "9": 0.561
+    "2": 0.54,
+    "3": 0.548,
+    "4": 0.543,
+    "5": 0.38,
+    "6": 0.354,
+    "7": 0.331,
+    "8": 0.341,
+    "9": 0.344
   }
 }
 ```
 
-Credits used: 54 · validation runs: 18 · LLM fix calls: 6
+Credits used: 9 · validation runs: 3 · LLM fix calls: 1
