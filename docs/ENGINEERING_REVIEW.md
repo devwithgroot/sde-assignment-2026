@@ -6,6 +6,39 @@ This session did not re-run `pytest`, `./run.sh`, or `sim grade`. Statements abo
 
 ---
 
+## 0. Supersession — revalidated 9 November 2026
+
+> **Do not treat the body of this document (sections 1–N below) as current truth.** It is a frozen 8 Nov review. Several findings were fixed or contradicted by later commits, by the locked `reports/public_*.md` files, and by `SUBMISSION.md` (9 Nov). Prefer `SUBMISSION.md`, the locked grade reports, `docs/IMPLEMENTATION_STATUS.md`, and the as-built section of `docs/IMPLEMENTATION_BLUEPRINT.md`.
+
+### Corrections vs current source and locked reports
+
+| 8 Nov claim (below) | Current status (9 Nov) | Evidence |
+|---|---|---|
+| public_02: 10 requests, 4 applied, **6 lapsed**; MTTR **null**; **54** credits / **18** validations / **6** LLM | **Superseded.** Locked grade: **9** requests, **8** approved, **1** expired, **0** lapsed, **8** applied; ks_cancel supervisor_edit **mttr_minutes=1455**; credits **9** / validations **3** / LLM **1** | `reports/public_02.md` |
+| public_02 ALL conclusion −1.7% (later summary) | **Superseded.** Locked ALL conclusion **+1.2%**, pickup **−0.6%**, engagement **+1.7%** | `reports/public_02.md` |
+| Promotion status overwritten every cycle; decay cannot see winners; rollback never fired | **Superseded for code.** Sticky promotion statuses are preserved in `plan_experiment` / `_persist_experiment` (`STICKY_PROMOTION_STATUSES`). public_02 **did** apply a decay rollback; W3 share fell then residualled at **0.344** because rollback restored the pre-promotion **explore** allocation | `controller/services/experiments.py`; `reports/public_02.md` decaying-variants block; `SUBMISSION.md` |
+| No `caller_id` builder / rotation path | **Superseded for code.** `build_caller_id_rotation_proposal` and `propose_caller_id_rotations` exist. **Still true as outcome:** graded public_02 has **zero** `caller_id` approval dims; DID share stayed **0.49–0.517** | `change_builder.py`, `governance.py`; `reports/public_02.md` |
+| Explore `guardrail_ok: True` hard-coded | **Superseded.** Explore dry-run now reports `guardrail_ok: None` / `not_assessed`. **Still true:** harmful exploration applies occurred (2 on each public grade) | `change_builder.py`; grade reports |
+| C13 crash/kill demonstrated as assignment floor | **Still Partial.** Exception-path recovery measured; intentional OS kill **not executed** | `reports/crash_recovery.md` |
+| IMPLEMENTATION_STATUS says phases 0–9 complete for the floor | **Superseded.** Status doc rewritten 9 Nov; does not claim full acceptance | `docs/IMPLEMENTATION_STATUS.md` |
+| Holm / multiple comparisons as textbook control | **Clarify.** Holm-**style** α thresholds are implemented; classical Holm step-down and its FWER guarantee are **not** claimed | `SUBMISSION.md` §1 / §13; blueprint as-built §G |
+
+### Findings that remain directionally valid
+
+- Caller-ID mitigation did not fire on graded public_02 (outcome gap; detector uses an all-time window).
+- Harmful exploration applies occurred on both public grades.
+- public_03 did not meet &lt;10 wall-min/day; Attempt A only reached **1080/7200**; event→decision lag not instrumented.
+- Intentional OS-level kill/restart remains unexecuted.
+- Explore impact score remains a coarse constant; true historical cohort replay is limited.
+- Feature cohorts beyond `default` were unused in graded runs.
+- Fairness reorders work; it does not hard-ration every cycle; experiment credit pool unused in graded runs.
+
+### What to ignore in the historical body
+
+Treat every concrete public_02 number that contradicts `reports/public_02.md` as **stale**. Treat “promotion overwrite prevents decay” as **stale relative to current `experiments.py`**. Treat “no caller_id builder” and “explore guardrail_ok True” as **stale relative to current builders**. Keep the assignment-requirement extraction (section 1) as still useful context.
+
+---
+
 ## 1. Assignment requirements
 
 Quoted or extracted from `README.md` and `docs/SIMULATOR.md`. These are the assignment's constraints, not a restatement of the implementation.
@@ -460,6 +493,8 @@ Contradictions to leave visible:
 ---
 
 ## 8. Prioritized findings
+
+> **9 Nov label:** Findings 1–3 below are historical (8 Nov). Re-read §0 before acting on them. Finding 1’s “overwrite” root cause is **fixed** in current `experiments.py`; residual W3 share after rollback remains a real outcome gap. Finding 2’s public_02 lapse/null-MTTR numbers are **wrong** against the locked grade (0 lapsed; MTTR 1455). Finding 3’s “no builder” claim is **wrong**; the graded non-firing outcome still stands. Finding 4 (harmful exploration) remains valid as an outcome.
 
 ### Critical
 

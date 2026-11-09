@@ -84,15 +84,18 @@ Build an always-on **workflow controller** that learns from simulated outcomes a
 - Optional walkthrough video ≤5 minutes
 
 ### Acceptance checklist (minimum floor)
-- [ ] public_01 starts and finishes through `run.sh` without manual steps
-- [ ] public_02 starts and finishes through `run.sh` without manual steps
-- [ ] C12 audit trail exists, even if other capabilities are cut
-- [ ] Governance boundary is never violated
-- [ ] Pickup/engagement/business outcome are calculated separately
-- [ ] Primary KPI improves or controller honestly remains conservative; guardrail is respected
-- [ ] Public_03 scale test is measured, not merely claimed
-- [ ] Restart does not duplicate events/actions or forget pending approvals
-- [ ] `SUBMISSION.md` is complete and stakeholder memos 01–06 are addressed
+
+> **As-built note (9 Nov 2026):** see [As-built architecture and implementation reconciliation — 9 November 2026](#as-built-architecture-and-implementation-reconciliation--9-november-2026) for current status. Do not treat an unexecuted OS-level kill/restart as complete.
+
+- [x] public_01 graded end-to-end (`reports/public_01.md`) — recorded runs used explicit `--advance-minutes` rather than only stock `run.sh` defaults
+- [x] public_02 graded end-to-end (`reports/public_02.md`) — same caveat on advance size
+- [x] C12 audit trail exists (`audit_decisions`; sample query in `SUBMISSION.md` §10)
+- [x] Governance boundary is never violated (all applies via approval path in graded reports; `auto_applied: 0`)
+- [x] Pickup/engagement/business outcome are calculated separately
+- [~] Primary KPI / guardrail — net ALL lift on both public grades, but **harmful exploration applies** occurred (2 on public_01, 2 on public_02)
+- [~] Public_03 scale test is measured — **partial** only (1080/7200); decision lag not instrumented; SRE &lt;10 wall-min/day unmet
+- [~] Restart does not duplicate events/actions or forget pending approvals — **exception-path** recovery demonstrated; intentional OS kill **not executed**; HTTP-level duplicate POSTs not independently verified
+- [x] `SUBMISSION.md` is complete and stakeholder memos 01–06 are addressed
 
 ---
 
@@ -1025,27 +1028,170 @@ This is a recommendation, not an assignment mandate. State what is built/partial
 
 ## 15. Final review gate (before submission)
 
-Cursor/user must verify every item and mark evidence:
+Cursor/user must verify every item and mark evidence. Status below reflects HEAD as of **9 Nov 2026** (see as-built section). Markers: `[x]` met, `[~]` partial, `[ ]` unmet / not verified.
 
-- [ ] No changes under `sim/`
-- [ ] No controller import of `sim`
-- [ ] No controller reads `runs/` or hidden scenario data
-- [ ] All config mutations use approval/apply or permitted auto-apply
-- [ ] No cadence/window/capacity/retry edits
-- [ ] KPI denominators correct and metrics separate
-- [ ] One shared cohort engine used across modules
-- [ ] Statistical winner selection deterministic; LLM never selects winner
-- [ ] Population thresholds and minimum samples prevent anecdotal actions
-- [ ] Prompt validation evidence included and credits tracked
-- [ ] Supervisor edit and stale-base behavior tested
-- [ ] Expiry, lapse, rejection, and re-proposal reconciled
-- [ ] Audit query answers why/when/who/evidence/after-effect
-- [ ] public_01 and public_02 run unattended and graded
-- [ ] public_03 numbers measured
-- [x] crash/restart evidence included (Phase 8: mocked unit recovery + `python -m controller.recovery`; live kill test still optional)
-- [ ] stakeholder memos 01–06 covered
-- [ ] SUBMISSION.md headings all retained and complete
-- [ ] Known weaknesses and cuts honest
-- [ ] Code/decisions defensible in 60-minute review
+- [x] No changes under `sim/`
+- [x] No controller import of `sim`
+- [x] No controller reads `runs/` or hidden scenario data as runtime input
+- [x] All config mutations use approval/apply or permitted auto-apply
+- [x] No cadence/window/capacity/retry edits
+- [x] KPI denominators correct and metrics separate
+- [~] One shared cohort engine used across modules — table exists; graded runs used only `default`; dial-time `calls.cohort_id` is a separate key
+- [x] Statistical winner selection deterministic; LLM never selects winner
+- [~] Population thresholds and minimum samples prevent anecdotal actions — true for detection gates; exploration can still ship harmful population applies before a winner
+- [x] Prompt validation evidence included and credits tracked (public_02: 9 credits / 3 validations / 1 LLM)
+- [~] Supervisor edit and stale-base behavior tested — unit-covered; live public_02 shows one prompt MTTR and one supervisor edit without MTTR
+- [x] Expiry, lapse, rejection, and re-proposal reconciled in code; graded public_02: 1 expired, 0 lapsed
+- [~] Audit query answers why/when/who/evidence/after-effect — store + sample rows exist; not a pasted CI artifact
+- [x] public_01 and public_02 graded (`reports/public_01.md`, `reports/public_02.md`)
+- [~] public_03 numbers measured — partial run to **1080/7200**; event→decision lag **not instrumented**
+- [~] crash/restart evidence — **exception-path** recovery demonstrated (`reports/crash_recovery.md` Evidence A). Intentional OS-level kill/restart (`scripts/crash_recovery_demo.ps1`) is **NOT EXECUTED** and must **never** be marked complete until run and verified
+- [x] stakeholder memos 01–06 covered in `SUBMISSION.md`
+- [x] SUBMISSION.md headings all retained and complete
+- [x] Known weaknesses and cuts honest
+- [~] Code/decisions defensible in 60-minute review — prepared; OS-kill and full-day load gaps remain
 
 **The controller should be boring in the best sense:** deterministic where it must be, cautious with evidence, governed at every change, resilient to restarts, and able to explain every action from its own records.
+
+---
+
+## As-built architecture and implementation reconciliation — 9 November 2026
+
+> This section records what was **actually built** on `feat/outcome-first-agent-loop`. It does **not** replace the planned design above. Planned vs as-built must stay distinct. Evidence labels: **measured** (reports/logs), **tested** (unit/integration present), **inferred** (code path without matching public run), **not verified**.
+
+### A. Actual component architecture
+
+```text
+Simulator :8700 (HTTP only)
+        |
+controller.main  (or controller.recovery — no /sim/advance)
+  SimulatorClient (controller/api/)
+  Settings (controller/settings.py) — default advance_minutes=60
+  Store SQLite WAL (controller/persistence/)
+  services pipeline (controller/services/)
+  domain/cohorts.py
+        |
+dashboard/  (read-only FastAPI over the same SQLite)
+```
+
+| Area | Responsibility | Primary modules |
+|---|---|---|
+| API | HTTP client + Pydantic payloads | `controller/api/client.py`, `models.py` |
+| Ingest | Idempotent chunk fetch/commit | `services/ingestion.py`, `services/parsing.py`, `Store.commit_chunk` |
+| Join / project | Leads/calls/campaigns + cohort_assignments | `services/joiner.py` |
+| Cohorts | Shared assignment helper (`default` in graded runs) | `domain/cohorts.py` |
+| Metrics | Pickup / engagement / conclusion windows | `services/metrics.py` |
+| Detection | Population signals incl. caller_id (all-time window) | `services/detector.py` |
+| Experiments | Plan / evaluate / persist; sticky promotion | `services/experiments.py`, `statistics.py` |
+| Decay | Promoted-winner decay hits | `services/decay.py` |
+| Change builders | Explore, winner, prompt, rollback, caller-id rotation | `services/change_builder.py` |
+| Incidents / prompts | Open/sync incidents; LLM→validate→propose | `services/incidents.py`, `prompt_incident.py` |
+| Governance | Approvals, apply, uncertain auto-apply, explore/winner/rollback/rotation | `services/governance.py` |
+| Fairness / credits | WFQ order, deferrals, emergency reserve | `services/fairness.py`, `credits.py` |
+| Audit / observability | `audit_decisions`, counters, alerts, supervisor summary | `services/audit.py`, `observability.py` |
+| Recovery | CLI + reconcile helpers | `controller/recovery.py`, `services/crash_recovery.py` |
+| Dashboard | Read-only supervisor view | `dashboard/app.py`, `queries.py`, `render.py` |
+
+### B. Actual controller cycle ordering (`controller/main.py`)
+
+Outer loop: optional bootstrap `run_cycle` (no advance) → then repeat `next_advance_minutes` → `client.advance` → `run_cycle` until finished.
+
+**Inside `run_cycle` (exact order):**
+1. `observe` / `_refresh`
+2. `ingest_available`
+3. `project_events`
+4. `compute_and_store_workflow_views`
+5. `detect_all`
+6. `run_all_experiments`
+7. `sync_incidents_from_signals` (+ link open incidents to experiments)
+8. `detect_promoted_decay`
+9. `CreditBudget.refresh_from_sim` + `FairScheduler.ensure_workflows`
+10. `run_prompt_incident_cycle` (fairness-ordered workflows)
+11. `run_governance_cycle` (fairness-ordered workflows/experiments)
+12. `bump_counter("controller.cycles")` + `build_supervisor_summary`
+
+**Inside `run_governance_cycle`:**
+1. `reconcile_approvals`
+2. `reconcile_uncertain_auto_applies`
+3. `_refresh_experiments_promotion_from_store`
+4. `apply_approved`
+5. `propose_experiment_exploration`
+6. `promote_experiment_winners`
+7. `propose_decay_rollbacks`
+8. `propose_caller_id_rotations`
+9. second `reconcile_approvals` + `apply_approved`
+
+### C. Storage and recovery architecture
+
+- **Storage:** single SQLite WAL file (`--db` / `CONTROLLER_DB`). Schema in `controller/persistence/db.py`; access via `repositories.py`. No migrations directory.
+- **Idempotency keys:** chunk identity, `event_id`, `proposal_id`, approval rows.
+- **Recovery CLI** (`python -m controller.recovery`): idempotent ingest → reconcile approvals → apply approved → resume prompt cycle → audit/alert. **Does not** advance time. **Does not** call `reconcile_uncertain_auto_applies` (that runs in the live governance cycle).
+- **Evidence A (measured):** unexpected `AttributeError` mid-public_01 → recovery → resume to `finished=true` (`reports/crash_recovery.md`).
+- **Evidence B (not verified):** intentional OS kill via `scripts/crash_recovery_demo.ps1` — **NOT EXECUTED**. HTTP-level duplicate POSTs not independently verified.
+
+### D. Dashboard and audit architecture
+
+- **Dashboard:** separate read-only process over the controller DB; not started by `run.sh`.
+- **Audit:** `audit_decisions` via `services/audit.py`. Sample “why did X change” trail documented in `SUBMISSION.md` §10 from retained `data/ctrl_public01.sqlite`.
+
+### E. Blueprint module → as-built file mapping
+
+| Blueprint concept | As-built location |
+|---|---|
+| `main.py` / settings | `controller/main.py`, `settings.py` |
+| `api/client.py`, `models.py` | same |
+| `domain/models.py`, `enums.py` | **not present** as separate modules; domain is `domain/cohorts.py` |
+| `workflow_registry.py` | folded into `observe()` in `main.py` |
+| `ingestion.py` / normalizer | `services/ingestion.py`, `parsing.py` |
+| `joiner.py` / `cohort_engine.py` | `services/joiner.py`, `domain/cohorts.py` |
+| `metrics.py` / `detector.py` | `services/metrics.py`, `detector.py` |
+| `experiment_planner.py` / `statistics.py` | `services/experiments.py`, `statistics.py` |
+| `incident_response.py` | `services/incidents.py`, `prompt_incident.py` |
+| `change_builder.py` / impact | `services/change_builder.py` (+ `dry_run_impact` in experiments) |
+| `governance.py` / apply / rollback | `services/governance.py`, `decay.py`, rollback builder in `change_builder.py` |
+| `supervisor_view.py` | `dashboard/` + `observability.build_supervisor_summary` |
+| `fairness.py` / credits | `services/fairness.py`, `credits.py` |
+| `audit/` | `services/audit.py` |
+| Crash script | `controller/recovery.py`; kill demo `scripts/crash_recovery_demo.ps1` (**unexecuted**) |
+
+### F. C1–C15 as-built status
+
+Aligned with `SUBMISSION.md` (conservative).
+
+| # | Status | Evidence / gap |
+|---|---|---|
+| C1 | **Partial** | **Measured:** public_03 Attempt A to 1080/7200; Attempt B disk-full. **Tested:** ingest/storage. Gap: &lt;10 wall-min/day unmet |
+| C2 | **Partial** | **Tested:** cohorts. **Measured:** graded configs `"cohorts": 0` / only `default`. Gap: feature cohorts unused |
+| C3 | **Built** | **Measured:** history before D0 (5,537,379 on public_03) |
+| C4 | **Cut** | No schedule/hour writer |
+| C5 | **Partial** | **Inferred/tested:** rotation builder. **Measured:** public_02 DID share 0.49–0.517; **zero** `caller_id` approvals. Detector uses `window="all"` |
+| C6 | **Partial** | **Measured:** welcome explores/promotes. Voice unused. Holm-style thresholds only (see §G) |
+| C7 | **Partial** | **Measured:** public_02 rollback applied; W3 ended at **0.344** because rollback restored pre-promotion **explore** weights. Sticky promotion **tested** |
+| C8 | **Partial** | **Measured:** ks_cancel prompt MTTR **1455**; credits 9 / val 3 / LLM 1. nw_renewal supervisor edit has **no MTTR**. Open incidents remained |
+| C9 | **Built** | **Tested** + graded governance hygiene (public_02: 9 requests, 8 approved, 1 expired, 0 lapsed) |
+| C10 | **Built** | Fields present; explore guardrail reported `not_assessed` |
+| C11 | **Built** | Dashboard exists; not part of `run.sh` |
+| C12 | **Built** | `audit_decisions` + sample query |
+| C13 | **Partial** | Exception-path **measured**. OS kill **not verified** |
+| C14 | **Partial** | Counters/summary **tested**. Event→decision lag **not instrumented** |
+| C15 | **Partial** | WFQ/credits **tested**. Experiment credit pool unused in graded runs |
+
+### G. Statistical limitation (Holm)
+
+- Implementation: two-proportion z-test; per-comparison α thresholds `α/(m-rank)` via `holm_adjust`.
+- This is **not** textbook Holm step-down. Classical stop-at-first-non-rejection is not applied.
+- The standard Holm family-wise error-rate guarantee **cannot be claimed**.
+- No empirical false-positive rate for this approximation was measured.
+
+### H. Remaining gaps called out by public evidence
+
+| Topic | Fact |
+|---|---|
+| Harmful exploration | public_01: 2 harmful applies; public_02: 2 harmful applies (**measured**) |
+| Caller-ID | Share stayed 0.49–0.517; no rotation proposal in graded public_02 (**measured**) |
+| Cohorts | Only `default` in graded runs (**measured**) |
+| Decay/rollback | Rollback restores explore allocation → W3 residual 0.344 (**measured** + **code**) |
+| Prompt verification | `_verify_applied_prompt_fixes` exists; live closure incomplete (open incidents observation) |
+| Fairness | Reorders; does not hard-ration work each cycle |
+| public_03 | 1080/7200; lag not instrumented; SRE target unmet (**measured**) |
+| Crash kill demo | Script present; **not executed** |
