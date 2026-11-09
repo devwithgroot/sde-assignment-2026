@@ -20,6 +20,7 @@ from controller.services.change_builder import (
 from controller.services.detector import Signal
 from controller.services.experiments import ExperimentArmState, ExperimentState, persist_experiment
 from controller.services.governance import (
+    ControllerApproval,
     apply_approved,
     next_advance_minutes,
     persist_proposal,
@@ -30,9 +31,10 @@ from controller.services.governance import (
     reconcile_uncertain_auto_applies,
     run_governance_cycle,
     submit_proposal,
+    workflow_has_uncertain_auto_apply,
 )
 from controller.services.incidents import mark_incident_mitigating, open_or_refresh_incident
-from controller.services.prompt_incident import run_prompt_incident_cycle
+from controller.services.prompt_incident import LlmAttempt, run_prompt_incident_cycle, should_start_attempt
 
 
 def _workflow(**overrides) -> Workflow:
@@ -1329,4 +1331,451 @@ def test_http_408_auto_apply_stays_uncertain(tmp_path):
     assert submitted.route == "auto_apply"
     assert puts == ["/workflows/nw_renewal/config"]
     assert store.get_proposal(built.proposal_id)["status"] == "auto_apply_uncertain"
+    store.close()
+
+
+def test_apply_approved_skips_while_auto_apply_is_uncertain(tmp_path):
+    store = Store(tmp_path / "apply_block.sqlite")
+    exp = _winner_experiment()
+    persist_experiment(store, exp)
+    uncertain = _uncertain_proposal("experiment_explore", "exp_explore", "prop_uncertain_block")
+    persist_proposal(store, uncertain)
+    approved = ProposalDraft(
+        proposal_id="prop_approved_blocked",
+        workflow_id="nw_renewal",
+        base_version=1,
+        status="approved",
+        source="experiment_winner",
+        source_ref=exp.experiment_id,
+        changed_dims=["welcome_message"],
+        proposed_config=_proposed_config(),
+        change_summary="approved winner",
+        diff={"changed_dims": ["welcome_message"]},
+        dry_run={},
+        impact_score=0.5,
+        affected_leads=10,
+        rationale="approved while another write is uncertain",
+        approval_id="apr_blocked",
+        route="approval",
+    )
+    persist_proposal(store, approved)
+    store.upsert_controller_approval(
+        ControllerApproval(
+            approval_id="apr_blocked",
+            proposal_id=approved.proposal_id,
+            workflow_id="nw_renewal",
+            status="approved",
+            base_version=1,
+            changed_dims=["welcome_message"],
+            updated_at="t0",
+            apply_by="t_apply",
+        )
+    )
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        raise AssertionError(f"unexpected request {request.method} {request.url.path}")
+
+    applied = apply_approved(_mock_client(handler), store)
+    assert applied == []
+    assert calls == []
+    assert store.get_proposal(uncertain.proposal_id)["status"] == "auto_apply_uncertain"
+    assert store.get_proposal(approved.proposal_id)["status"] == "approved"
+    assert store.get_controller_approval("apr_blocked")["status"] == "approved"
+    assert any(
+        row["kind"] == "apply_deferred_uncertain_auto_apply" for row in store.list_audit("nw_renewal")
+    )
+    store.close()
+
+
+def test_run_governance_cycle_blocks_on_live_config_lookup_failure(tmp_path):
+    store = Store(tmp_path / "cycle_lookup.sqlite")
+    exp = _winner_experiment()
+    persist_experiment(store, exp)
+    draft = _uncertain_proposal("experiment_winner", exp.experiment_id, "prop_cycle_lookup")
+    persist_proposal(store, draft)
+    approved = ProposalDraft(
+        proposal_id="prop_cycle_approved",
+        workflow_id="nw_renewal",
+        base_version=1,
+        status="approved",
+        source="experiment_winner",
+        source_ref=exp.experiment_id,
+        changed_dims=["welcome_message"],
+        proposed_config=_proposed_config(),
+        change_summary="approved winner",
+        diff={"changed_dims": ["welcome_message"]},
+        dry_run={},
+        impact_score=0.5,
+        affected_leads=10,
+        rationale="must stay blocked while uncertain",
+        approval_id="apr_cycle",
+        route="approval",
+    )
+    persist_proposal(store, approved)
+    store.upsert_controller_approval(
+        ControllerApproval(
+            approval_id="apr_cycle",
+            proposal_id=approved.proposal_id,
+            workflow_id="nw_renewal",
+            status="approved",
+            base_version=1,
+            changed_dims=["welcome_message"],
+            updated_at="t0",
+        )
+    )
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.method == "GET" and request.url.path.startswith("/approvals"):
+            return httpx.Response(
+                200,
+                json={
+                    "approval_id": "apr_cycle",
+                    "proposal_id": approved.proposal_id,
+                    "workflow_id": "nw_renewal",
+                    "status": "approved",
+                    "base_version": 1,
+                    "changed_dims": ["welcome_message"],
+                    "created_at": "t0",
+                    "expires_at": None,
+                    "apply_by": None,
+                    "decided_at": None,
+                    "reasons": [],
+                },
+            )
+        if request.method == "GET" and request.url.path.endswith("/config"):
+            return httpx.Response(500, json={"error": "config_unavailable"})
+        raise AssertionError(f"unexpected request {request.method} {request.url.path}")
+
+    report = run_governance_cycle(
+        _mock_client(handler), store, [_workflow()], [_config()], [exp]
+    )
+    assert report.applied == 0
+    assert report.auto_applied == 0
+    assert store.get_proposal(draft.proposal_id)["status"] == "auto_apply_uncertain"
+    assert workflow_has_uncertain_auto_apply(store, "nw_renewal")
+    assert not any(method == "POST" and path.endswith("/apply") for method, path in calls)
+    assert not any(method == "PUT" for method, _path in calls)
+    assert promote_experiment_winners(
+        _mock_client(handler), store, [_workflow()], [_config()], [exp]
+    ) == []
+    store.close()
+
+
+def test_proven_recovery_unblocks_the_workflow(tmp_path):
+    store = Store(tmp_path / "unblock.sqlite")
+    exp = _winner_experiment()
+    persist_experiment(store, exp)
+    draft = _uncertain_proposal("experiment_winner", exp.experiment_id, "prop_unblock")
+    persist_proposal(store, draft)
+    client, calls = _counting_client(_proposed_config())
+    recovered = reconcile_uncertain_auto_applies(client, store, [_workflow()])
+    assert [item.proposal_id for item in recovered] == [draft.proposal_id]
+    assert not workflow_has_uncertain_auto_apply(store, "nw_renewal")
+    assert store.get_proposal(draft.proposal_id)["status"] == "auto_applied"
+    assert not any(method == "PUT" for method, _path in calls)
+    store.close()
+
+
+def test_recovered_auto_apply_count_is_retained_in_governance_report(tmp_path):
+    store = Store(tmp_path / "count.sqlite")
+    exp = _winner_experiment()
+    persist_experiment(store, exp)
+    draft = _uncertain_proposal("experiment_winner", exp.experiment_id, "prop_count")
+    persist_proposal(store, draft)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/config"):
+            body = _config(version=2).model_dump()
+            body["config"] = _proposed_config()
+            return httpx.Response(200, json=body)
+        if request.method == "GET" and request.url.path.startswith("/approvals"):
+            return httpx.Response(404, json={"error": "not_found"})
+        raise AssertionError(f"unexpected request {request.method} {request.url.path}")
+
+    # Pass no live experiment objects so this report only counts recovery, not a
+    # same-cycle rebuild against the still-stale in-memory promotion status.
+    report = run_governance_cycle(
+        _mock_client(handler), store, [_workflow()], [_config()], []
+    )
+    assert report.auto_applied == 1
+    assert any("auto_apply_recovered=1" in note for note in report.notes)
+    assert store.get_proposal(draft.proposal_id)["status"] == "auto_applied"
+    assert store.get_experiment(exp.experiment_id)["promotion_status"] == "promoted_auto_apply"
+    store.close()
+
+
+def test_recovered_winner_does_not_duplicate_in_same_governance_cycle(tmp_path):
+    store = Store(tmp_path / "same_cycle_winner.sqlite")
+    exp = _winner_experiment()
+    persist_experiment(store, exp)
+    draft = _uncertain_proposal("experiment_winner", exp.experiment_id, "prop_same_cycle_winner")
+    persist_proposal(store, draft)
+    # Simulate a cycle that still holds the pre-recovery in-memory status.
+    exp.promotion_status = "ready_to_propose_observe_only"
+    posts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/config"):
+            body = _config(version=2).model_dump()
+            body["config"] = _proposed_config()
+            return httpx.Response(200, json=body)
+        if request.method == "GET" and request.url.path.startswith("/approvals"):
+            return httpx.Response(404, json={"error": "not_found"})
+        if request.method == "POST":
+            posts.append(request.url.path)
+            raise AssertionError(f"unexpected proposal submit {request.url.path}")
+        raise AssertionError(f"unexpected request {request.method} {request.url.path}")
+
+    report = run_governance_cycle(
+        _mock_client(handler), store, [_workflow()], [_config()], [exp]
+    )
+    assert report.auto_applied == 1
+    assert posts == []
+    assert store.get_proposal(draft.proposal_id)["status"] == "auto_applied"
+    assert store.get_experiment(exp.experiment_id)["promotion_status"] == "promoted_auto_apply"
+    assert exp.promotion_status == "promoted_auto_apply"
+    assert [
+        row["proposal_id"]
+        for row in store.list_proposals("nw_renewal")
+        if row["source"] == "experiment_winner"
+    ] == [draft.proposal_id]
+    store.close()
+
+
+def test_recovered_explore_does_not_duplicate_in_same_governance_cycle(tmp_path):
+    store = Store(tmp_path / "same_cycle_explore.sqlite")
+    exp = _experiment("exp_explore_same", status="running", decision="underpowered")
+    persist_experiment(store, exp)
+    draft = _uncertain_proposal("experiment_explore", exp.experiment_id, "prop_same_cycle_explore")
+    persist_proposal(store, draft)
+    exp.promotion_status = "ready_to_propose_observe_only"
+    posts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/config"):
+            body = _config(version=2).model_dump()
+            body["config"] = _proposed_config()
+            return httpx.Response(200, json=body)
+        if request.method == "GET" and request.url.path.startswith("/approvals"):
+            return httpx.Response(404, json={"error": "not_found"})
+        if request.method == "POST":
+            posts.append(request.url.path)
+            raise AssertionError(f"unexpected proposal submit {request.url.path}")
+        raise AssertionError(f"unexpected request {request.method} {request.url.path}")
+
+    report = run_governance_cycle(
+        _mock_client(handler), store, [_workflow()], [_config()], [exp]
+    )
+    assert report.auto_applied == 1
+    assert posts == []
+    assert store.get_proposal(draft.proposal_id)["status"] == "auto_applied"
+    assert store.get_experiment(exp.experiment_id)["promotion_status"] == "exploration_submitted"
+    assert exp.promotion_status == "exploration_submitted"
+    assert [
+        row["proposal_id"]
+        for row in store.list_proposals("nw_renewal")
+        if row["source"] == "experiment_explore"
+    ] == [draft.proposal_id]
+    store.close()
+
+
+def test_stale_in_memory_experiment_does_not_create_duplicate_proposals(tmp_path):
+    store = Store(tmp_path / "stale_memory.sqlite")
+    winner = _winner_experiment()
+    winner.promotion_status = "promoted_auto_apply"
+    persist_experiment(store, winner)
+    explore = _experiment("exp_explore_memory", status="running", decision="underpowered")
+    explore.promotion_status = "exploration_submitted"
+    persist_experiment(store, explore)
+
+    stale_winner = _winner_experiment()
+    stale_winner.promotion_status = "ready_to_propose_observe_only"
+    stale_explore = _experiment("exp_explore_memory", status="running", decision="underpowered")
+    stale_explore.promotion_status = "ready_to_propose_observe_only"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request {request.method} {request.url.path}")
+
+    client = _mock_client(handler)
+    assert (
+        promote_experiment_winners(client, store, [_workflow()], [_config()], [stale_winner])
+        == []
+    )
+    assert (
+        propose_experiment_exploration(client, store, [_workflow()], [_config()], [stale_explore])
+        == []
+    )
+    assert stale_winner.promotion_status == "promoted_auto_apply"
+    assert stale_explore.promotion_status == "exploration_submitted"
+    store.close()
+
+
+def test_persisted_retryable_and_rejected_promotion_statuses_are_respected(tmp_path):
+    store = Store(tmp_path / "status_sync.sqlite")
+    stale = _winner_experiment()
+    stale.experiment_id = "exp_stale_sync"
+    for arm in stale.arms:
+        arm.experiment_id = stale.experiment_id
+    stale.promotion_status = "promotion_stale"
+    persist_experiment(store, stale)
+
+    rejected = _winner_experiment()
+    rejected.experiment_id = "exp_rejected_sync"
+    for arm in rejected.arms:
+        arm.experiment_id = rejected.experiment_id
+    rejected.promotion_status = "promotion_rejected"
+    persist_experiment(store, rejected)
+
+    stale_memory = _winner_experiment()
+    stale_memory.experiment_id = "exp_stale_sync"
+    for arm in stale_memory.arms:
+        arm.experiment_id = stale_memory.experiment_id
+    stale_memory.promotion_status = "ready_to_propose_observe_only"
+
+    rejected_memory = _winner_experiment()
+    rejected_memory.experiment_id = "exp_rejected_sync"
+    for arm in rejected_memory.arms:
+        arm.experiment_id = rejected_memory.experiment_id
+    rejected_memory.promotion_status = "ready_to_propose_observe_only"
+
+    posts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/config"):
+            return httpx.Response(200, json=_config().model_dump())
+        if request.method == "POST" and request.url.path == "/approvals":
+            body = json.loads(request.content.decode())
+            posts.append(body["proposal_id"])
+            return httpx.Response(
+                200,
+                json={
+                    "approval_id": f"apr_{len(posts)}",
+                    "proposal_id": body["proposal_id"],
+                    "workflow_id": "nw_renewal",
+                    "status": "pending",
+                    "base_version": body["base_version"],
+                    "changed_dims": ["welcome_message"],
+                },
+            )
+        raise AssertionError(f"unexpected request {request.method} {request.url.path}")
+
+    client = _mock_client(handler)
+    stale_out = promote_experiment_winners(
+        client, store, [_workflow()], [_config()], [stale_memory]
+    )
+    assert len(stale_out) == 1
+    assert stale_memory.promotion_status == "promotion_stale"
+    rejected_out = promote_experiment_winners(
+        client, store, [_workflow()], [_config()], [rejected_memory]
+    )
+    assert rejected_out == []
+    assert rejected_memory.promotion_status == "promotion_rejected"
+    assert len(posts) == 1
+    store.close()
+
+
+def test_recovered_prompt_proposal_syncs_llm_attempt_without_re_suggest(tmp_path):
+    store = Store(tmp_path / "prompt_recover.sqlite")
+    incident = open_or_refresh_incident(
+        store,
+        Signal(
+            fingerprint="nw|hallucination_spike|recover",
+            workflow_id="nw_renewal",
+            signal_type="hallucination_spike",
+            kpi="halluc_rate",
+            dimension="workflow",
+            cohort_id=None,
+            caller_id=None,
+            severity="high",
+            baseline_value=0.01,
+            recent_value=0.08,
+            baseline_n=200,
+            recent_n=200,
+            threshold=0.02,
+            message="hallucination flag rate rose",
+            evidence={},
+            sim_ts="t",
+        ),
+    )
+    proposed = {
+        "prompt_version": "P2",
+        "cohorts": [],
+        "allocations": {"default": {"welcome_message": {"W1": 1.0}, "voice": {"V1": 1.0}}},
+        "schedule": {},
+    }
+    draft = ProposalDraft(
+        proposal_id="prop_prompt_uncertain",
+        workflow_id="nw_renewal",
+        base_version=1,
+        status="auto_apply_uncertain",
+        source="prompt_incident",
+        source_ref=incident.incident_id,
+        changed_dims=["prompt_version"],
+        proposed_config=proposed,
+        change_summary="prompt fix",
+        diff={"changed_dims": ["prompt_version"]},
+        dry_run={},
+        impact_score=0.4,
+        affected_leads=10,
+        rationale="lost prompt auto-apply response",
+        route="auto_apply",
+    )
+    persist_proposal(store, draft)
+    mark_incident_mitigating(store, incident.incident_id, draft.proposal_id)
+    store.upsert_llm_attempt(
+        LlmAttempt(
+            attempt_id="llm_prompt_uncertain",
+            incident_id=incident.incident_id,
+            workflow_id="nw_renewal",
+            status="proposed",
+            problem="hallucination",
+            created_at="t0",
+            updated_at="t0",
+            selected_prompt_version="P2",
+            selected_validation_run_id="val_1",
+            related_proposal_id=draft.proposal_id,
+        )
+    )
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.method == "GET" and request.url.path.endswith("/config"):
+            body = _config(version=2).model_dump()
+            body["config"] = proposed
+            return httpx.Response(200, json=body)
+        raise AssertionError(f"unexpected request {request.method} {request.url.path}")
+
+    recovered = reconcile_uncertain_auto_applies(_mock_client(handler), store, [_workflow()])
+    assert [item.proposal_id for item in recovered] == [draft.proposal_id]
+    attempt = store.list_llm_attempts(incident.incident_id)[0]
+    assert attempt["status"] == "submitted"
+    assert attempt["related_proposal_id"] == draft.proposal_id
+    ok, reason = should_start_attempt(store, incident)
+    assert ok is False
+    assert "proposal_already_in_flight_or_applied" in reason or "prior_attempt" in reason
+    state = SimState.model_validate(
+        {
+            "scenario": "unit",
+            "sim_minute": 0,
+            "ts": "2027-01-04T00:00:00+05:30",
+            "end_minute": 100,
+            "finished": False,
+            "tick_minutes": 15,
+            "credits_remaining": 50,
+            "chunks": 1,
+            "last_event_id": 1,
+        }
+    )
+    report = run_prompt_incident_cycle(
+        _mock_client(handler), store, [_workflow()], [_config()], state
+    )
+    assert report.attempted == 0
+    assert not any(path.startswith("/llm/") for _method, path in calls)
+    assert not any(path.startswith("/validation/") for _method, path in calls)
+    assert not any(method == "PUT" for method, _path in calls)
     store.close()

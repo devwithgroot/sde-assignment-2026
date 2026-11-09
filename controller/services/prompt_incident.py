@@ -65,38 +65,50 @@ RETRYABLE_ATTEMPT_STATUSES = frozenset(
 
 def sync_attempt_with_proposal_status(store: Store, proposal_id: str, proposal_status: str) -> None:
     """When a prompt proposal ends, release or lock the related LLM attempt accordingly."""
-    mapping = {
+    failure_mapping = {
         "stale": "proposal_stale",
         "lapsed": "proposal_lapsed",
         "expired": "proposal_expired",
         "rejected": "proposal_rejected",
     }
-    attempt_status = mapping.get(proposal_status)
-    if attempt_status is None:
+    success_statuses = frozenset({"submitted", "approved", "applied", "auto_applied"})
+    if proposal_status in failure_mapping:
+        attempt_status = failure_mapping[proposal_status]
+        error_code = f"proposal_{proposal_status}"
+        error_detail = f"related proposal {proposal_id} became {proposal_status}"
+    elif proposal_status in success_statuses:
+        # Keep the attempt blocking/completed so recovery does not re-suggest.
+        attempt_status = "submitted"
+        error_code = None
+        error_detail = None
+    else:
         return
     for row in store.list_llm_attempts():
         if row["related_proposal_id"] != proposal_id:
             continue
-        if row["status"] in {"submitted", "proposed"}:
-            attempt = LlmAttempt(
-                attempt_id=row["attempt_id"],
-                incident_id=row["incident_id"],
-                workflow_id=row["workflow_id"],
-                status=attempt_status,
-                problem=row["problem"],
-                created_at=row["created_at"],
-                updated_at=_now(),
-                request=json.loads(row["request_json"]) if row["request_json"] else None,
-                response=json.loads(row["response_json"]) if row["response_json"] else None,
-                error_code=f"proposal_{proposal_status}",
-                error_detail=f"related proposal {proposal_id} became {proposal_status}",
-                credits_before=row["credits_before"],
-                credits_after=row["credits_after"],
-                selected_prompt_version=row["selected_prompt_version"],
-                selected_validation_run_id=row["selected_validation_run_id"],
-                related_proposal_id=row["related_proposal_id"],
-            )
-            store.upsert_llm_attempt(attempt)
+        if row["status"] not in {"submitted", "proposed"}:
+            continue
+        if attempt_status == "submitted" and row["status"] == "submitted" and error_code is None:
+            continue
+        attempt = LlmAttempt(
+            attempt_id=row["attempt_id"],
+            incident_id=row["incident_id"],
+            workflow_id=row["workflow_id"],
+            status=attempt_status,
+            problem=row["problem"],
+            created_at=row["created_at"],
+            updated_at=_now(),
+            request=json.loads(row["request_json"]) if row["request_json"] else None,
+            response=json.loads(row["response_json"]) if row["response_json"] else None,
+            error_code=error_code,
+            error_detail=error_detail,
+            credits_before=row["credits_before"],
+            credits_after=row["credits_after"],
+            selected_prompt_version=row["selected_prompt_version"],
+            selected_validation_run_id=row["selected_validation_run_id"],
+            related_proposal_id=row["related_proposal_id"],
+        )
+        store.upsert_llm_attempt(attempt)
 
 
 @dataclass
@@ -750,7 +762,10 @@ def run_prompt_incident_cycle(
 
 def _verify_applied_prompt_fixes(store: Store) -> None:
     """Lightweight post-apply check using stored metric snapshots — no fabricated success."""
-    for prop in store.list_proposals(status="applied"):
+    props: list[Any] = []
+    for status in ("applied", "auto_applied"):
+        props.extend(store.list_proposals(status=status))
+    for prop in props:
         if prop["source"] != "prompt_incident":
             continue
         incident_id = prop["source_ref"]

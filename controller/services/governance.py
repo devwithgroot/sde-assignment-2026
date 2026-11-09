@@ -648,6 +648,21 @@ def apply_approved(client: SimulatorClient, store: Store) -> list[dict[str, Any]
 
     rows.sort(key=_apply_by_key)
     for row in rows:
+        if workflow_has_uncertain_auto_apply(store, row["workflow_id"]):
+            audit(
+                store,
+                kind="apply_deferred_uncertain_auto_apply",
+                summary=(
+                    f"Deferred apply of {row['approval_id']}: workflow still has "
+                    "an unresolved auto_apply_uncertain proposal"
+                ),
+                details={"approval_id": row["approval_id"], "proposal_id": row["proposal_id"]},
+                workflow_id=row["workflow_id"],
+                related_approval_id=row["approval_id"],
+                related_proposal_id=row["proposal_id"],
+                idempotency_parts=[row["approval_id"], "defer_uncertain"],
+            )
+            continue
         try:
             result = client.apply_approval(row["workflow_id"], row["approval_id"])
         except SimulatorError as exc:
@@ -799,6 +814,29 @@ def _approver_attention_ok(store: Store, workflow: Workflow) -> tuple[bool, str]
     return True, "ok"
 
 
+def _refresh_experiment_promotion_from_store(store: Store, exp: ExperimentState) -> None:
+    """Copy only the persisted promotion status onto the in-memory experiment.
+
+    Crash recovery may update SQLite after the cycle already loaded ExperimentState
+    objects. Eligibility checks must see that status without reloading arms or KPI
+    evidence from a possibly older row.
+    """
+    row = store.get_experiment(exp.experiment_id)
+    if row is None:
+        return
+    persisted = row["promotion_status"]
+    if persisted is None:
+        return
+    exp.promotion_status = persisted
+
+
+def _refresh_experiments_promotion_from_store(
+    store: Store, experiments: list[ExperimentState]
+) -> None:
+    for exp in experiments:
+        _refresh_experiment_promotion_from_store(store, exp)
+
+
 def propose_experiment_exploration(
     client: SimulatorClient,
     store: Store,
@@ -812,6 +850,7 @@ def propose_experiment_exploration(
     out: list[ProposalDraft] = []
     seen_wf: set[str] = set()
     for exp in experiments:
+        _refresh_experiment_promotion_from_store(store, exp)
         if workflow_has_uncertain_auto_apply(store, exp.workflow_id):
             seen_wf.add(exp.workflow_id)
             continue
@@ -911,6 +950,7 @@ def promote_experiment_winners(
     by_cfg = {c.workflow_id: c for c in configs}
     out: list[ProposalDraft] = []
     for exp in experiments:
+        _refresh_experiment_promotion_from_store(store, exp)
         if exp.status != "winner" or not exp.winner_variant:
             continue
         if workflow_has_uncertain_auto_apply(store, exp.workflow_id):
@@ -1553,6 +1593,8 @@ def _record_recovered_uncertain_auto_apply(
         ),
         idempotency_parts=[draft.proposal_id, "auto_apply_recovered", int(live.version)],
     )
+    if source == "prompt_incident":
+        _sync_prompt_attempt_for_proposal(store, draft.proposal_id, "auto_applied")
     return draft
 
 
@@ -1643,13 +1685,17 @@ def run_governance_cycle(
     report.approvals_reconciled = len(reconciled)
     report.rejected_or_expired = sum(1 for a in reconciled if a.status in {"rejected", "expired", "lapsed"})
 
-    applied = apply_approved(client, store)
-    report.applied = len(applied)
-
+    # Resolve uncertain auto-applies before any /apply. An approved apply must
+    # not race ahead of an unresolved write on the same workflow.
     recovered_applies = reconcile_uncertain_auto_applies(client, store, workflows)
     report.auto_applied += len(recovered_applies)
     if recovered_applies:
         report.notes.append(f"auto_apply_recovered={len(recovered_applies)}")
+    # Recovery may have written sticky promotion statuses after these objects were loaded.
+    _refresh_experiments_promotion_from_store(store, experiments)
+
+    applied = apply_approved(client, store)
+    report.applied = len(applied)
 
     explorations = propose_experiment_exploration(client, store, workflows, configs, experiments)
     promotions = promote_experiment_winners(client, store, workflows, configs, experiments)
@@ -1658,7 +1704,8 @@ def run_governance_cycle(
     report.proposals_submitted = sum(
         1 for p in built if p.status in {"submitted", "approved", "auto_applied", "applied"}
     )
-    report.auto_applied = sum(1 for p in built if p.status == "auto_applied")
+    # Keep recovered auto-applies in the count; only add newly auto-applied rows.
+    report.auto_applied += sum(1 for p in built if p.status == "auto_applied")
     report.incidents_linked = sum(1 for p in promotions if p.approval_id or p.status == "auto_applied")
     if explorations:
         report.notes.append(f"exploration_proposals={len(explorations)}")
