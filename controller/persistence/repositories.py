@@ -697,7 +697,12 @@ class Store:
         )
 
     def active_experiment_dimension(self, workflow_id: str, cohort_id: str) -> str | None:
-        """Return dimension of a non-terminal experiment for this workflow/cohort, if any."""
+        """Return dimension of a non-terminal experiment for this workflow/cohort, if any.
+
+        Only ``planned`` / ``running`` count as active. Terminal statuses such as
+        ``winner``, ``inconclusive``, ``guardrail_violation``, ``stopped``, and
+        ``no_safe_candidates`` do not block later reconsideration or another dimension.
+        """
         row = self.conn.execute(
             """SELECT dimension FROM experiments
                WHERE workflow_id = ? AND cohort_id = ?

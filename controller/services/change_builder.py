@@ -17,12 +17,16 @@ from controller.api.models import Workflow, WorkflowConfig
 from controller.domain.cohorts import DEFAULT_COHORT_ID, MIN_COHORT_SAMPLE
 from controller.persistence.repositories import Store
 from controller.services.detector import CALLER_ID_DROP_VS_WORKFLOW
+from controller.services.audit import audit
 from controller.services.experiments import (
     DEFAULT_MIN_EFFECT,
     ExperimentState,
+    NO_SAFE_CANDIDATES,
     allocation_diff,
     balanced_allocation,
+    collect_guardrail_violating_variants,
     dry_run_impact,
+    normalize_allocation_weights,
     normalize_primary_kpi,
     parse_guardrail,
 )
@@ -151,45 +155,93 @@ def build_explore_proposal(
     experiment: ExperimentState,
 ) -> ProposalDraft | None:
     """Propose the experiment's planned balanced allocation so underpowered arms can gather samples."""
+    if experiment.decision in {NO_SAFE_CANDIDATES, "winner"} or experiment.status == NO_SAFE_CANDIDATES:
+        return None
     if experiment.decision not in {"underpowered", "inconclusive"} and experiment.status not in {
         "planned",
         "running",
     }:
         return None
-    if experiment.decision == "winner":
-        return None
     if experiment.dimension not in ("welcome_message", "voice"):
         return None
-    planned = {str(k): float(v) for k, v in (experiment.planned_allocation or {}).items() if float(v) > 0}
-    if len(planned) < 2:
+    planned_raw = {
+        str(k): float(v) for k, v in (experiment.planned_allocation or {}).items() if float(v) > 0
+    }
+    if len(planned_raw) < 2:
         return None
     allowed = set(getattr(workflow.options, experiment.dimension) or [])
-    if any(v not in allowed for v in planned):
+    if any(v not in allowed for v in planned_raw):
         return None
+
+    # Do not trust the caller's in-memory allocation alone — recheck persisted verdicts.
+    excluded = collect_guardrail_violating_variants(store, experiment.experiment_id, state=experiment)
+    safe_planned = normalize_allocation_weights(
+        {variant: weight for variant, weight in planned_raw.items() if variant not in excluded}
+    )
+    if len(safe_planned) < 2:
+        excluded_sorted = sorted(excluded)
+        reason = (
+            f"explore blocked: fewer than two safe {experiment.dimension} variants remain after "
+            f"excluding guardrail_violation arms {excluded_sorted}"
+        )
+        audit(
+            store,
+            kind=NO_SAFE_CANDIDATES,
+            summary=reason,
+            details={
+                "dimension": experiment.dimension,
+                "planned_allocation": planned_raw,
+                "excluded_guardrail_violations": excluded_sorted,
+                "safe_allocation": safe_planned,
+                "source": "build_explore_proposal",
+            },
+            workflow_id=workflow.workflow_id,
+            tenant_id=workflow.tenant_id,
+            cohort_id=experiment.cohort_id,
+            related_experiment_id=experiment.experiment_id,
+            idempotency_parts=[
+                NO_SAFE_CANDIDATES,
+                "explore",
+                experiment.experiment_id,
+                ",".join(excluded_sorted),
+            ],
+        )
+        return None
+
     current = ((config.config.get("allocations") or {}).get(experiment.cohort_id) or {}).get(
         experiment.dimension
     ) or {}
     current_w = {str(k): float(v) for k, v in current.items()} if isinstance(current, dict) else {}
-    if total_variation(current_w, planned) < 1e-6:
+    if total_variation(current_w, safe_planned) < 1e-6:
         return None
     proposed = set_allocation(
         config.config,
         cohort_id=experiment.cohort_id or DEFAULT_COHORT_ID,
         dimension=experiment.dimension,
-        weights=planned,
+        weights=safe_planned,
     )
+    # Safety: excluded variants must not appear in the target allocation.
+    target_alloc = ((proposed.get("allocations") or {}).get(experiment.cohort_id) or {}).get(
+        experiment.dimension
+    ) or {}
+    if any(variant in excluded for variant in target_alloc):
+        return None
     dims = changed_dims(config.config, proposed)
     if not dims or any(d not in ALLOCATION_DIMS for d in dims):
         return None
     dry = {
         "label": "exploration_allocation",
         "limitation": (
-            "Exploration reallocates traffic to gather samples; it does not claim a causal KPI lift."
+            "Exploration reallocates traffic to gather samples; it does not claim a causal KPI lift. "
+            "Guardrail safety for this exploration allocation has not been assessed against live arm "
+            "rates, so guardrail_ok is reported as not_assessed rather than claimed true."
         ),
         "current_allocation": current_w,
-        "planned_allocation": planned,
+        "planned_allocation": safe_planned,
+        "excluded_guardrail_violations": sorted(excluded),
         "sample_ok": False,
-        "guardrail_ok": True,
+        "guardrail_ok": None,
+        "guardrail_assessment": "not_assessed",
         "impact_score": 0.25,
         "max_shift": max_allocation_shift(config.config, proposed),
     }
@@ -198,7 +250,7 @@ def build_explore_proposal(
     )
     summary = (
         f"Explore {experiment.dimension} on {workflow.workflow_id}/{experiment.cohort_id} "
-        f"with balanced allocation {planned}"
+        f"with balanced allocation {safe_planned}"
     )
     rationale = (
         f"Experiment {experiment.experiment_id} is {experiment.decision or experiment.status}; "
@@ -208,7 +260,7 @@ def build_explore_proposal(
         "explore",
         experiment.experiment_id,
         config.version,
-        json.dumps(planned, sort_keys=True),
+        json.dumps(safe_planned, sort_keys=True),
     )
     now = _now()
     return ProposalDraft(
@@ -224,7 +276,7 @@ def build_explore_proposal(
         diff={
             "dimension": experiment.dimension,
             "cohort_id": experiment.cohort_id,
-            "allocation": allocation_diff(current_w, planned),
+            "allocation": allocation_diff(current_w, safe_planned),
             "changed_dims": dims,
             "max_shift": dry["max_shift"],
         },
@@ -236,7 +288,12 @@ def build_explore_proposal(
             "experiment_id": experiment.experiment_id,
             "decision": experiment.decision,
             "min_sample_per_arm": experiment.min_sample_per_arm,
+            "excluded_guardrail_violations": sorted(excluded),
             "observe_note": "Exploration only; dry_run is not causal proof.",
+            "guardrail_note": (
+                "guardrail_ok is not_assessed for exploration; no measured guardrail comparison "
+                "was performed for this allocation proposal."
+            ),
         },
         created_at=now,
         updated_at=now,

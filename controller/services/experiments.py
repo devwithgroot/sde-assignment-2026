@@ -15,6 +15,7 @@ from typing import Any, Mapping
 from controller.api.models import Workflow, WorkflowConfig
 from controller.domain.cohorts import DEFAULT_COHORT_ID, MIN_COHORT_SAMPLE, cohort_is_actionable
 from controller.persistence.repositories import Store
+from controller.services.audit import audit
 from controller.services.statistics import (
     Proportion,
     decide_challenger,
@@ -28,7 +29,10 @@ DEFAULT_MIN_EFFECT = 0.02
 CONTROL_FLOOR = 0.30
 EXPLORATION_FLOOR = 0.10
 ACTIVE_STATUSES = frozenset({"planned", "running"})
-TERMINAL_STATUSES = frozenset({"winner", "inconclusive", "guardrail_violation", "stopped"})
+TERMINAL_STATUSES = frozenset(
+    {"winner", "inconclusive", "guardrail_violation", "stopped", "no_safe_candidates"}
+)
+NO_SAFE_CANDIDATES = "no_safe_candidates"
 # Statuses written by promotion, governance, or decay. A later stats refresh must not clear them.
 STICKY_PROMOTION_STATUSES = frozenset(
     {
@@ -256,6 +260,61 @@ def experiment_id_for(workflow_id: str, cohort_id: str, dimension: str) -> str:
     return f"{workflow_id}|{cohort_id}|{dimension}"
 
 
+def _evidence_dict(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def collect_guardrail_violating_variants(
+    store: Store,
+    experiment_id: str,
+    *,
+    state: ExperimentState | None = None,
+) -> set[str]:
+    """Variants previously marked guardrail_violation for this experiment id.
+
+    Losers are intentionally excluded from this set — failing to beat control is
+    not the same as violating a guardrail.
+    """
+    harmful: set[str] = set()
+    for row in store.list_experiment_arms(experiment_id):
+        if row["verdict"] == "guardrail_violation":
+            harmful.add(str(row["variant"]))
+    existing = store.get_experiment(experiment_id)
+    if existing is not None:
+        for variant in _evidence_dict(existing["evidence_json"]).get("guardrail_violations") or []:
+            harmful.add(str(variant))
+    if state is not None:
+        for arm in state.arms:
+            if arm.verdict == "guardrail_violation":
+                harmful.add(arm.variant)
+        for variant in (state.evidence or {}).get("guardrail_violations") or []:
+            harmful.add(str(variant))
+    return harmful
+
+
+def normalize_allocation_weights(weights: Mapping[str, float]) -> dict[str, float]:
+    cleaned: dict[str, float] = {}
+    for key, value in weights.items():
+        try:
+            weight = float(value)
+        except (TypeError, ValueError):
+            continue
+        if weight > 0:
+            cleaned[str(key)] = weight
+    total = sum(cleaned.values())
+    if total <= 0:
+        return {}
+    return {k: round(v / total, 6) for k, v in sorted(cleaned.items())}
+
+
 def choose_control(observed: list[tuple[str, int, int, int]], allowed: list[str], current: dict[str, float]) -> str | None:
     """Prefer heaviest current allocation among allowed; else most dials; else first allowed."""
     if current:
@@ -353,6 +412,94 @@ def dry_run_impact(
     }
 
 
+def _record_no_safe_candidates(
+    store: Store,
+    *,
+    workflow: Workflow,
+    config: WorkflowConfig,
+    cohort_id: str,
+    dimension: str,
+    experiment_id: str,
+    allowed: list[str],
+    safe: list[str],
+    excluded: set[str],
+    existing: Any,
+    min_sample: int,
+    alpha: float,
+    min_effect: float,
+) -> ExperimentState:
+    primary = normalize_primary_kpi(workflow.objective.primary)
+    guardrail_kpi, guardrail_drop = parse_guardrail(workflow.objective.guardrail)
+    now = _now()
+    created = existing["created_at"] if existing is not None else now
+    existing_promotion = existing["promotion_status"] if existing is not None else None
+    # Sticky promotion / human rejection must survive the terminal no-safe path.
+    if existing_promotion in STICKY_PROMOTION_STATUSES:
+        promotion_status = existing_promotion
+    else:
+        promotion_status = existing_promotion or "observe_only_not_promoted"
+    current = current_allocation(config.config, cohort_id, dimension)
+    excluded_sorted = sorted(excluded)
+    reason = (
+        f"fewer than two safe {dimension} variants remain after excluding "
+        f"guardrail_violation arms {excluded_sorted}; safe={safe}"
+    )
+    state = ExperimentState(
+        experiment_id=experiment_id,
+        workflow_id=workflow.workflow_id,
+        tenant_id=workflow.tenant_id,
+        cohort_id=cohort_id,
+        dimension=dimension,
+        primary_kpi=primary,
+        guardrail_kpi=guardrail_kpi,
+        guardrail_max_drop=guardrail_drop,
+        status=NO_SAFE_CANDIDATES,
+        control_variant=safe[0] if safe else (allowed[0] if allowed else ""),
+        planned_allocation={},
+        min_sample_per_arm=min_sample,
+        alpha=alpha,
+        min_effect=min_effect,
+        created_at=created,
+        updated_at=now,
+        decision=NO_SAFE_CANDIDATES,
+        decision_reason=reason,
+        winner_variant=None,
+        promotion_status=promotion_status,
+        evidence={
+            "allowed_options": allowed,
+            "safe_options": safe,
+            "excluded_guardrail_violations": excluded_sorted,
+            "current_allocation": current,
+            "mid_flight": workflow.mid_flight,
+            "observe_only": True,
+            "guardrail_violations": excluded_sorted,
+            "terminal": True,
+        },
+    )
+    audit(
+        store,
+        kind=NO_SAFE_CANDIDATES,
+        summary=reason,
+        details={
+            "dimension": dimension,
+            "allowed_options": allowed,
+            "safe_options": safe,
+            "excluded_guardrail_violations": excluded_sorted,
+        },
+        workflow_id=workflow.workflow_id,
+        tenant_id=workflow.tenant_id,
+        cohort_id=cohort_id,
+        related_experiment_id=experiment_id,
+        idempotency_parts=[
+            NO_SAFE_CANDIDATES,
+            experiment_id,
+            ",".join(excluded_sorted),
+            ",".join(safe),
+        ],
+    )
+    return state
+
+
 def plan_experiment(
     store: Store,
     workflow: Workflow,
@@ -378,13 +525,35 @@ def plan_experiment(
     if active_dim and active_dim != dim and existing is None:
         return None
 
+    excluded = collect_guardrail_violating_variants(store, eid)
+    safe = [v for v in allowed if v not in excluded]
+    if len(safe) < 2:
+        # Only record no_safe_candidates when exclusions caused the shortfall.
+        if excluded:
+            return _record_no_safe_candidates(
+                store,
+                workflow=workflow,
+                config=config,
+                cohort_id=cohort_id,
+                dimension=dim,
+                experiment_id=eid,
+                allowed=allowed,
+                safe=safe,
+                excluded=excluded,
+                existing=existing,
+                min_sample=min_sample,
+                alpha=alpha,
+                min_effect=min_effect,
+            )
+        return None
+
     observed = store.observed_variants(workflow.workflow_id, dim, cohort_id=cohort_id)
     current = current_allocation(config.config, cohort_id, dim)
-    # Only plan with allowed options; never invent variants.
-    control = choose_control(observed, allowed, current)
+    # Only plan with safe allowed options; never invent variants or reuse violators.
+    control = choose_control(observed, safe, current)
     if control is None:
         return None
-    challengers = [v for v in allowed if v != control]
+    challengers = [v for v in safe if v != control]
     if not challengers:
         return None
     variants = [control, *challengers]
@@ -414,6 +583,8 @@ def plan_experiment(
         promotion_status=existing_promotion or "observe_only_not_promoted",
         evidence={
             "allowed_options": allowed,
+            "safe_options": safe,
+            "excluded_guardrail_violations": sorted(excluded),
             "current_allocation": current,
             "mid_flight": workflow.mid_flight,
             "observe_only": True,
@@ -446,6 +617,12 @@ def plan_experiment(
 
 def evaluate_experiment(state: ExperimentState) -> ExperimentState:
     """Apply two-proportion z-tests with Holm correction. Deterministic."""
+    # Terminal no_safe_candidates must not be rewritten as inconclusive/no_winner
+    # when arms were intentionally left empty by planning.
+    if state.status == NO_SAFE_CANDIDATES or state.decision == NO_SAFE_CANDIDATES:
+        state.status = NO_SAFE_CANDIDATES
+        state.decision = NO_SAFE_CANDIDATES
+        return state
     control = next((a for a in state.arms if a.is_control), None)
     if control is None:
         state.status = "inconclusive"

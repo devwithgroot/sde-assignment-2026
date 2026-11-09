@@ -6,9 +6,14 @@ import json
 
 from controller.api.models import ChunkMeta, Workflow, WorkflowConfig
 from controller.persistence.repositories import Store
+from controller.services.change_builder import build_explore_proposal
 from controller.services.experiments import (
+    ExperimentArmState,
+    ExperimentState,
+    NO_SAFE_CANDIDATES,
     balanced_allocation,
     evaluate_experiment,
+    persist_experiment,
     plan_experiment,
     run_workflow_experiments,
     validate_variants,
@@ -294,3 +299,419 @@ def test_guardrail_violation(tmp_path):
     exp = results[0]
     arm_w2 = next(a for a in exp.arms if a.variant == "W2")
     assert arm_w2.verdict == "guardrail_violation" or exp.status == "guardrail_violation"
+
+
+def _persist_arm_verdict(
+    store: Store,
+    *,
+    experiment_id: str = "nw_renewal|default|welcome_message",
+    workflow_id: str = "nw_renewal",
+    cohort_id: str = "default",
+    dimension: str = "welcome_message",
+    control: str = "W1",
+    variants: dict[str, str],
+    planned: dict[str, float] | None = None,
+    promotion_status: str = "observe_only_not_promoted",
+) -> ExperimentState:
+    planned = planned or {v: round(1.0 / len(variants), 6) for v in variants}
+    state = ExperimentState(
+        experiment_id=experiment_id,
+        workflow_id=workflow_id,
+        tenant_id="northwind",
+        cohort_id=cohort_id,
+        dimension=dimension,
+        primary_kpi="engagement",
+        guardrail_kpi="pickup",
+        guardrail_max_drop=0.02,
+        status="guardrail_violation" if "guardrail_violation" in variants.values() else "inconclusive",
+        control_variant=control,
+        planned_allocation=planned,
+        min_sample_per_arm=100,
+        alpha=0.05,
+        min_effect=0.02,
+        created_at="t0",
+        updated_at="t1",
+        decision="guardrail_violation" if "guardrail_violation" in variants.values() else "no_winner",
+        decision_reason="seeded",
+        winner_variant=None,
+        promotion_status=promotion_status,
+        evidence={
+            "guardrail_violations": [v for v, verdict in variants.items() if verdict == "guardrail_violation"],
+            "losers": [v for v, verdict in variants.items() if verdict == "loser"],
+        },
+        arms=[
+            ExperimentArmState(
+                experiment_id=experiment_id,
+                variant=variant,
+                is_control=(variant == control),
+                planned_weight=planned.get(variant, 0.0),
+                dials=120,
+                connected=100,
+                engaged=40,
+                primary_rate=0.4,
+                guardrail_rate=0.5,
+                sample_n=100,
+                sample_ok=True,
+                verdict=verdict,
+            )
+            for variant, verdict in variants.items()
+        ],
+    )
+    persist_experiment(store, state)
+    return state
+
+
+def test_plan_excludes_prior_guardrail_violation(tmp_path):
+    store = Store(tmp_path / "excl.sqlite")
+    _seed_arms(store, control_engage_rate=0.3, treat_engage_rate=0.35, n=40)
+    wf = _workflow(
+        options={
+            "welcome_message": ["W1", "W2", "W3"],
+            "voice": ["V1", "V2"],
+            "caller_id": ["D1"],
+            "prompt_version": ["P1"],
+        }
+    )
+    _persist_arm_verdict(
+        store,
+        variants={"W1": "control", "W2": "guardrail_violation", "W3": "underpowered"},
+        planned={"W1": 0.34, "W2": 0.33, "W3": 0.33},
+    )
+    planned = plan_experiment(store, wf, _config(), dimension="welcome_message", min_sample=100)
+    assert planned is not None
+    assert planned.status == "planned"
+    assert "W2" not in planned.planned_allocation
+    assert set(planned.planned_allocation) == {"W1", "W3"}
+    assert abs(sum(planned.planned_allocation.values()) - 1.0) < 1e-6
+    assert planned.control_variant != "W2"
+    assert planned.evidence.get("excluded_guardrail_violations") == ["W2"]
+    store.close()
+
+
+def test_guardrail_exclusion_survives_persistence_and_replan(tmp_path):
+    db = tmp_path / "persist_excl.sqlite"
+    store = Store(db)
+    _seed_arms(store, control_engage_rate=0.3, treat_engage_rate=0.35, n=40)
+    wf = _workflow(
+        options={
+            "welcome_message": ["W1", "W2", "W3"],
+            "voice": ["V1", "V2"],
+            "caller_id": ["D1"],
+            "prompt_version": ["P1"],
+        }
+    )
+    _persist_arm_verdict(
+        store,
+        variants={"W1": "control", "W2": "guardrail_violation", "W3": "inconclusive"},
+        planned={"W1": 0.34, "W2": 0.33, "W3": 0.33},
+    )
+    store.close()
+
+    store2 = Store(db)
+    planned = plan_experiment(store2, wf, _config(), dimension="welcome_message", min_sample=100)
+    assert planned is not None
+    assert "W2" not in planned.planned_allocation
+    assert set(planned.planned_allocation) <= {"W1", "W3"}
+    store2.close()
+
+
+def test_guardrail_violating_control_never_selected(tmp_path):
+    store = Store(tmp_path / "ctrl.sqlite")
+    _seed_arms(store, control_engage_rate=0.3, treat_engage_rate=0.35, n=40)
+    wf = _workflow(
+        options={
+            "welcome_message": ["W1", "W2", "W3"],
+            "voice": ["V1", "V2"],
+            "caller_id": ["D1"],
+            "prompt_version": ["P1"],
+        }
+    )
+    # W1 dominates current allocation but was previously marked harmful.
+    _persist_arm_verdict(
+        store,
+        control="W1",
+        variants={"W1": "guardrail_violation", "W2": "control", "W3": "inconclusive"},
+        planned={"W1": 0.7, "W2": 0.2, "W3": 0.1},
+    )
+    cfg = _config()
+    cfg.config["allocations"]["default"]["welcome_message"] = {"W1": 0.9, "W2": 0.05, "W3": 0.05}
+    planned = plan_experiment(store, wf, cfg, dimension="welcome_message", min_sample=100)
+    assert planned is not None
+    assert planned.control_variant != "W1"
+    assert "W1" not in planned.planned_allocation
+    assert planned.control_variant in {"W2", "W3"}
+    store.close()
+
+
+def test_no_safe_candidates_blocks_explore_and_records_decision(tmp_path):
+    store = Store(tmp_path / "nosafe.sqlite")
+    _seed_arms(store, control_engage_rate=0.3, treat_engage_rate=0.35, n=40)
+    wf = _workflow()
+    _persist_arm_verdict(
+        store,
+        variants={"W1": "control", "W2": "guardrail_violation"},
+        planned={"W1": 0.5, "W2": 0.5},
+    )
+    planned = plan_experiment(store, wf, _config(), dimension="welcome_message", min_sample=100)
+    assert planned is not None
+    assert planned.status == NO_SAFE_CANDIDATES
+    assert planned.decision == NO_SAFE_CANDIDATES
+    assert planned.planned_allocation == {}
+    assert any(row["kind"] == NO_SAFE_CANDIDATES for row in store.list_audit("nw_renewal"))
+
+    evaluated = evaluate_experiment(planned)
+    persist_experiment(store, evaluated)
+    draft = build_explore_proposal(store, wf, _config(), evaluated)
+    assert draft is None
+    store.close()
+
+
+def test_no_safe_candidates_full_pipeline_terminal_and_sticky(tmp_path):
+    """plan → evaluate → persist → reload → replan → explore must keep no_safe_candidates."""
+    from controller.services.governance import propose_experiment_exploration
+
+    db = tmp_path / "nosafe_pipeline.sqlite"
+    store = Store(db)
+    _seed_arms(store, control_engage_rate=0.3, treat_engage_rate=0.35, n=120)
+    wf = _workflow()
+    cfg = _config()
+    _persist_arm_verdict(
+        store,
+        variants={"W1": "control", "W2": "guardrail_violation"},
+        planned={"W1": 0.5, "W2": 0.5},
+        promotion_status="promotion_rejected",
+    )
+
+    results = run_workflow_experiments(store, wf, cfg, min_sample=100)
+    assert results
+    exp = results[0]
+    assert exp.status == NO_SAFE_CANDIDATES
+    assert exp.decision == NO_SAFE_CANDIDATES
+    assert exp.decision != "no_winner"
+    assert exp.status != "inconclusive"
+    assert exp.planned_allocation == {}
+    assert exp.promotion_status == "promotion_rejected"
+    assert store.active_experiment_dimension("nw_renewal", "default") is None
+
+    row = store.get_experiment(exp.experiment_id)
+    assert row is not None
+    assert row["status"] == NO_SAFE_CANDIDATES
+    assert row["decision"] == NO_SAFE_CANDIDATES
+    assert row["promotion_status"] == "promotion_rejected"
+    store.close()
+
+    store2 = Store(db)
+    again = run_workflow_experiments(store2, wf, cfg, min_sample=100)
+    assert again
+    assert again[0].status == NO_SAFE_CANDIDATES
+    assert again[0].decision == NO_SAFE_CANDIDATES
+    assert again[0].promotion_status == "promotion_rejected"
+    assert store2.active_experiment_dimension("nw_renewal", "default") is None
+
+    class _Client:
+        def workflow_config(self, workflow_id: str) -> WorkflowConfig:
+            return cfg
+
+    assert build_explore_proposal(store2, wf, cfg, again[0]) is None
+    assert propose_experiment_exploration(_Client(), store2, [wf], [cfg], again) == []
+    assert any(r["kind"] == NO_SAFE_CANDIDATES for r in store2.list_audit("nw_renewal"))
+    store2.close()
+
+
+def test_loser_is_not_treated_as_harmful(tmp_path):
+    store = Store(tmp_path / "loser.sqlite")
+    _seed_arms(store, control_engage_rate=0.3, treat_engage_rate=0.35, n=40)
+    wf = _workflow(
+        options={
+            "welcome_message": ["W1", "W2", "W3"],
+            "voice": ["V1", "V2"],
+            "caller_id": ["D1"],
+            "prompt_version": ["P1"],
+        }
+    )
+    _persist_arm_verdict(
+        store,
+        variants={"W1": "control", "W2": "loser", "W3": "inconclusive"},
+        planned={"W1": 0.34, "W2": 0.33, "W3": 0.33},
+    )
+    planned = plan_experiment(store, wf, _config(), dimension="welcome_message", min_sample=100)
+    assert planned is not None
+    assert "W2" in planned.planned_allocation
+    assert planned.evidence.get("excluded_guardrail_violations") == []
+    store.close()
+
+
+def test_build_explore_cannot_reintroduce_persisted_harmful_variant(tmp_path):
+    store = Store(tmp_path / "reintro.sqlite")
+    wf = _workflow(
+        options={
+            "welcome_message": ["W1", "W2", "W3"],
+            "voice": ["V1", "V2"],
+            "caller_id": ["D1"],
+            "prompt_version": ["P1"],
+        }
+    )
+    _persist_arm_verdict(
+        store,
+        variants={"W1": "control", "W2": "guardrail_violation", "W3": "underpowered"},
+        planned={"W1": 0.34, "W2": 0.33, "W3": 0.33},
+    )
+    # Stale in-memory allocation still lists the harmful variant.
+    stale = ExperimentState(
+        experiment_id="nw_renewal|default|welcome_message",
+        workflow_id="nw_renewal",
+        tenant_id="northwind",
+        cohort_id="default",
+        dimension="welcome_message",
+        primary_kpi="engagement",
+        guardrail_kpi="pickup",
+        guardrail_max_drop=0.02,
+        status="running",
+        control_variant="W1",
+        planned_allocation={"W1": 0.34, "W2": 0.33, "W3": 0.33},
+        min_sample_per_arm=100,
+        alpha=0.05,
+        min_effect=0.02,
+        created_at="t0",
+        updated_at="t1",
+        decision="underpowered",
+        decision_reason="need samples",
+        winner_variant=None,
+        promotion_status="observe_only_not_promoted",
+        evidence={},
+        arms=[],
+    )
+    draft = build_explore_proposal(store, wf, _config(), stale)
+    assert draft is not None
+    welcome = draft.proposed_config["allocations"]["default"]["welcome_message"]
+    assert "W2" not in welcome
+    assert set(welcome) == {"W1", "W3"}
+    assert abs(sum(welcome.values()) - 1.0) < 1e-6
+    assert draft.dry_run.get("guardrail_ok") is None
+    assert draft.dry_run.get("guardrail_assessment") == "not_assessed"
+    assert "not_assessed" in draft.dry_run["limitation"]
+    # Voice and other cohorts untouched.
+    assert draft.proposed_config["allocations"]["default"]["voice"] == {"V1": 1.0}
+    assert draft.changed_dims == ["welcome_message"]
+    store.close()
+
+
+def test_build_explore_no_safe_candidates_when_only_harmful_remain(tmp_path):
+    store = Store(tmp_path / "explore_nosafe.sqlite")
+    wf = _workflow()
+    _persist_arm_verdict(
+        store,
+        variants={"W1": "control", "W2": "guardrail_violation"},
+        planned={"W1": 0.5, "W2": 0.5},
+    )
+    stale = ExperimentState(
+        experiment_id="nw_renewal|default|welcome_message",
+        workflow_id="nw_renewal",
+        tenant_id="northwind",
+        cohort_id="default",
+        dimension="welcome_message",
+        primary_kpi="engagement",
+        guardrail_kpi="pickup",
+        guardrail_max_drop=0.02,
+        status="running",
+        control_variant="W1",
+        planned_allocation={"W1": 0.5, "W2": 0.5},
+        min_sample_per_arm=100,
+        alpha=0.05,
+        min_effect=0.02,
+        created_at="t0",
+        updated_at="t1",
+        decision="underpowered",
+        decision_reason="need samples",
+        winner_variant=None,
+        promotion_status="observe_only_not_promoted",
+        evidence={},
+        arms=[],
+    )
+    assert build_explore_proposal(store, wf, _config(), stale) is None
+    assert any(row["kind"] == NO_SAFE_CANDIDATES for row in store.list_audit("nw_renewal"))
+    store.close()
+
+
+def test_build_explore_dry_run_does_not_claim_guardrail_ok(tmp_path):
+    store = Store(tmp_path / "dry.sqlite")
+    exp = ExperimentState(
+        experiment_id="nw_renewal|default|welcome_message",
+        workflow_id="nw_renewal",
+        tenant_id="northwind",
+        cohort_id="default",
+        dimension="welcome_message",
+        primary_kpi="engagement",
+        guardrail_kpi="pickup",
+        guardrail_max_drop=0.02,
+        status="running",
+        control_variant="W1",
+        planned_allocation={"W1": 0.5, "W2": 0.5},
+        min_sample_per_arm=100,
+        alpha=0.05,
+        min_effect=0.02,
+        created_at="t0",
+        updated_at="t1",
+        decision="underpowered",
+        decision_reason="need samples",
+        winner_variant=None,
+        promotion_status="observe_only_not_promoted",
+        evidence={},
+        arms=[],
+    )
+    draft = build_explore_proposal(store, _workflow(), _config(), exp)
+    assert draft is not None
+    assert draft.dry_run.get("guardrail_ok") is None
+    assert draft.dry_run.get("guardrail_assessment") == "not_assessed"
+    assert "not been assessed" in draft.dry_run["limitation"].lower() or "not_assessed" in draft.dry_run[
+        "limitation"
+    ]
+    store.close()
+
+
+def test_explore_proposal_does_not_modify_other_cohort_or_dimension(tmp_path):
+    store = Store(tmp_path / "scope.sqlite")
+    cfg = _config()
+    cfg.config["allocations"] = {
+        "default": {
+            "welcome_message": {"W1": 1.0},
+            "voice": {"V1": 0.6, "V2": 0.4},
+            "caller_id": {"D1": 1.0},
+        },
+        "cohort_north": {
+            "welcome_message": {"W1": 0.8, "W2": 0.2},
+            "voice": {"V1": 1.0},
+            "caller_id": {"D1": 1.0},
+        },
+    }
+    exp = ExperimentState(
+        experiment_id="nw_renewal|default|welcome_message",
+        workflow_id="nw_renewal",
+        tenant_id="northwind",
+        cohort_id="default",
+        dimension="welcome_message",
+        primary_kpi="engagement",
+        guardrail_kpi="pickup",
+        guardrail_max_drop=0.02,
+        status="running",
+        control_variant="W1",
+        planned_allocation={"W1": 0.5, "W2": 0.5},
+        min_sample_per_arm=100,
+        alpha=0.05,
+        min_effect=0.02,
+        created_at="t0",
+        updated_at="t1",
+        decision="underpowered",
+        decision_reason="need samples",
+        winner_variant=None,
+        promotion_status="observe_only_not_promoted",
+        evidence={},
+        arms=[],
+    )
+    draft = build_explore_proposal(store, _workflow(), cfg, exp)
+    assert draft is not None
+    assert draft.changed_dims == ["welcome_message"]
+    assert draft.proposed_config["allocations"]["default"]["voice"] == {"V1": 0.6, "V2": 0.4}
+    assert draft.proposed_config["allocations"]["default"]["caller_id"] == {"D1": 1.0}
+    assert draft.proposed_config["allocations"]["cohort_north"] == cfg.config["allocations"]["cohort_north"]
+    store.close()

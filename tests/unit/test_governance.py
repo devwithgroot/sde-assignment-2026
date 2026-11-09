@@ -514,6 +514,8 @@ def test_build_explore_proposal_when_underpowered(tmp_path):
     assert draft.source == "experiment_explore"
     assert "welcome_message" in draft.changed_dims
     assert abs(draft.proposed_config["allocations"]["default"]["welcome_message"]["W2"] - 0.5) < 1e-6
+    assert draft.dry_run.get("guardrail_ok") is None
+    assert draft.dry_run.get("guardrail_assessment") == "not_assessed"
     store.close()
 
 
