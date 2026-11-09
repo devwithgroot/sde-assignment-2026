@@ -20,7 +20,11 @@ from controller.services.audit import audit
 from controller.services.change_builder import build_prompt_proposal
 from controller.services.credits import CreditBudget
 from controller.services.fairness import ACTION_PROMPT_INCIDENT, FairScheduler
-from controller.services.governance import submit_proposal
+from controller.services.governance import (
+    reconcile_uncertain_auto_applies,
+    submit_proposal,
+    workflow_has_uncertain_auto_apply,
+)
 from controller.services.incidents import (
     Incident,
     mark_incident_mitigating,
@@ -225,6 +229,8 @@ def _resume_proposed_attempts(
             continue
         if prop["status"] not in {"draft", "failed", "blocked_auto_apply"}:
             continue
+        if workflow_has_uncertain_auto_apply(store, row["workflow_id"]):
+            continue
         workflow = by_wf.get(row["workflow_id"])
         if workflow is None:
             continue
@@ -355,6 +361,7 @@ def run_prompt_incident_cycle(
         order_index = {w.workflow_id: i for i, w in enumerate(ordered)}
         eligible.sort(key=lambda inc: (order_index.get(inc.workflow_id, 10_000), inc.incident_id))
 
+    reconcile_uncertain_auto_applies(client, store, workflows)
     _resume_proposed_attempts(client, store, workflows, report)
 
     if not eligible:
@@ -366,6 +373,9 @@ def run_prompt_incident_cycle(
         workflow = by_wf.get(incident.workflow_id)
         if workflow is None:
             report.notes.append(f"missing workflow object for {incident.workflow_id}")
+            continue
+        if workflow_has_uncertain_auto_apply(store, incident.workflow_id):
+            report.notes.append(f"{incident.incident_id}: skip (auto_apply_uncertain)")
             continue
         ok, reason = should_start_attempt(store, incident)
         if not ok:

@@ -135,9 +135,12 @@ def save_snapshot(
 def _auto_apply_outcome_ambiguous(exc: SimulatorError) -> bool:
     """True when the PUT may already have been committed.
 
-    A timeout, a dropped connection, or a 5xx can happen after the simulator
-    applied the config. A 4xx is a definite refusal and did not apply.
+    A timeout, a dropped connection, an HTTP 408, or a 5xx can happen after the
+    simulator applied the config. Other 4xx responses, including 403 and 409,
+    are definite refusals and did not apply.
     """
+    if exc.status == 408:
+        return True
     if 400 <= exc.status < 500:
         return False
     return True
@@ -809,6 +812,9 @@ def propose_experiment_exploration(
     out: list[ProposalDraft] = []
     seen_wf: set[str] = set()
     for exp in experiments:
+        if workflow_has_uncertain_auto_apply(store, exp.workflow_id):
+            seen_wf.add(exp.workflow_id)
+            continue
         if exp.workflow_id in seen_wf:
             continue
         if exp.decision not in {"underpowered", "inconclusive"} and exp.status not in {"planned", "running"}:
@@ -907,6 +913,8 @@ def promote_experiment_winners(
     for exp in experiments:
         if exp.status != "winner" or not exp.winner_variant:
             continue
+        if workflow_has_uncertain_auto_apply(store, exp.workflow_id):
+            continue
         if exp.promotion_status in BLOCK_WINNER_REPROMOTE_STATUSES:
             continue
         workflow = by_wf.get(exp.workflow_id)
@@ -976,6 +984,8 @@ def propose_decay_rollbacks(
     for hit in decay_hits:
         workflow = by_wf.get(hit["workflow_id"])
         if workflow is None:
+            continue
+        if workflow_has_uncertain_auto_apply(store, hit["workflow_id"]):
             continue
         already = [
             p
@@ -1425,6 +1435,8 @@ def propose_caller_id_rotations(
                         idempotency_parts=[prop["proposal_id"], "auto_apply_unreconciled"],
                     )
                 break
+            if workflow_has_uncertain_auto_apply(store, workflow.workflow_id):
+                break
             drafts = [prop for prop in rows if prop["status"] == "draft"]
             unconfirmed = [prop for prop in rows if prop["status"] == "submitted_unconfirmed"]
             if drafts or unconfirmed:
@@ -1466,6 +1478,152 @@ def propose_caller_id_rotations(
     return out
 
 
+def workflow_has_uncertain_auto_apply(store: Store, workflow_id: str) -> bool:
+    """True while a config write for this workflow may already be live."""
+    return any(
+        prop["status"] == "auto_apply_uncertain" for prop in store.list_proposals(workflow_id)
+    )
+
+
+_EXPERIMENT_STATUS_AFTER_AUTO_APPLY = {
+    "experiment_winner": "promoted_auto_apply",
+    "experiment_explore": "exploration_submitted",
+    "decay_rollback": "rolled_back",
+}
+
+
+def _record_recovered_uncertain_auto_apply(
+    store: Store,
+    workflow: Workflow | None,
+    prop: Any,
+    live: WorkflowConfig,
+) -> ProposalDraft:
+    """Record one proven auto-apply on its original proposal. Never sends a PUT."""
+    draft = _draft_from_stored_proposal(prop)
+    draft.status = "auto_applied"
+    draft.route = "auto_apply"
+    draft.error_code = None
+    draft.error_detail = None
+    draft.submitted_at = draft.submitted_at or _now()
+    draft.updated_at = _now()
+    persist_proposal(store, draft)
+    if workflow is not None:
+        _snapshot_recovered_caller_apply(
+            store, workflow, draft.proposal_id, int(live.version), live.config
+        )
+    else:
+        save_snapshot(
+            store,
+            workflow_id=draft.workflow_id,
+            version=int(live.version),
+            config=live.config,
+            source="post_apply",
+            related_proposal_id=draft.proposal_id,
+        )
+    source = str(prop["source"] or "")
+    source_ref = prop["source_ref"]
+    promotion = _EXPERIMENT_STATUS_AFTER_AUTO_APPLY.get(source)
+    if promotion and source_ref:
+        store.update_experiment_promotion(str(source_ref), promotion)
+    if source == CALLER_ID_ROTATION_SOURCE:
+        _resolve_matching_caller_rotation(
+            store,
+            draft.workflow_id,
+            draft.proposal_id,
+            resolution=f"Recovered auto-applied rotation {draft.proposal_id} → v{live.version}",
+        )
+    audit(
+        store,
+        kind="auto_apply_recovered",
+        summary=f"Recovered auto-applied {source} proposal {draft.proposal_id} → v{live.version}",
+        details={
+            "source": source,
+            "proposal_id": draft.proposal_id,
+            "base_version": prop["base_version"],
+            "version": int(live.version),
+        },
+        workflow_id=draft.workflow_id,
+        tenant_id=workflow.tenant_id if workflow is not None else None,
+        related_proposal_id=draft.proposal_id,
+        related_experiment_id=(
+            str(source_ref) if promotion and source_ref else None
+        ),
+        related_incident_id=(
+            str(source_ref) if source == CALLER_ID_ROTATION_SOURCE and source_ref else None
+        ),
+        idempotency_parts=[draft.proposal_id, "auto_apply_recovered", int(live.version)],
+    )
+    return draft
+
+
+def reconcile_uncertain_auto_applies(
+    client: SimulatorClient,
+    store: Store,
+    workflows: list[Workflow],
+) -> list[ProposalDraft]:
+    """Prove or hold every auto-apply whose response was lost.
+
+    A proven row stays the original proposal and becomes auto_applied. An
+    unproven row, or a workflow whose live config cannot be read, stays
+    auto_apply_uncertain. This never sends another PUT and never creates a
+    replacement proposal.
+    """
+    by_wf = {workflow.workflow_id: workflow for workflow in workflows}
+    grouped: dict[str, list[Any]] = {}
+    for prop in store.list_proposals(status="auto_apply_uncertain"):
+        grouped.setdefault(str(prop["workflow_id"]), []).append(prop)
+    recovered: list[ProposalDraft] = []
+    for workflow_id, props in grouped.items():
+        workflow = by_wf.get(workflow_id)
+        try:
+            live = client.workflow_config(workflow_id)
+        except SimulatorError as exc:
+            for prop in props:
+                audit(
+                    store,
+                    kind="auto_apply_uncertain_unreconciled",
+                    summary=(
+                        f"Auto-apply {prop['proposal_id']} stays uncertain; "
+                        "live config could not be read"
+                    ),
+                    details={
+                        "source": prop["source"],
+                        "proposal_id": prop["proposal_id"],
+                        "reason": "live_config_unavailable",
+                        "code": exc.code,
+                    },
+                    workflow_id=workflow_id,
+                    tenant_id=workflow.tenant_id if workflow is not None else None,
+                    related_proposal_id=str(prop["proposal_id"]),
+                    idempotency_parts=[prop["proposal_id"], "live_config_unavailable"],
+                )
+            continue
+        for prop in props:
+            if _auto_apply_is_proven(live, prop):
+                recovered.append(
+                    _record_recovered_uncertain_auto_apply(store, workflow, prop, live)
+                )
+                continue
+            audit(
+                store,
+                kind="auto_apply_uncertain_unreconciled",
+                summary=f"Auto-apply {prop['proposal_id']} is not confirmed on the live config",
+                details={
+                    "source": prop["source"],
+                    "proposal_id": prop["proposal_id"],
+                    "reason": "not_proven",
+                    "base_version": prop["base_version"],
+                    "live_version": live.version,
+                    "route": prop["route"],
+                },
+                workflow_id=workflow_id,
+                tenant_id=workflow.tenant_id if workflow is not None else None,
+                related_proposal_id=str(prop["proposal_id"]),
+                idempotency_parts=[prop["proposal_id"], "not_proven"],
+            )
+    return recovered
+
+
 def run_governance_cycle(
     client: SimulatorClient,
     store: Store,
@@ -1487,6 +1645,11 @@ def run_governance_cycle(
 
     applied = apply_approved(client, store)
     report.applied = len(applied)
+
+    recovered_applies = reconcile_uncertain_auto_applies(client, store, workflows)
+    report.auto_applied += len(recovered_applies)
+    if recovered_applies:
+        report.notes.append(f"auto_apply_recovered={len(recovered_applies)}")
 
     explorations = propose_experiment_exploration(client, store, workflows, configs, experiments)
     promotions = promote_experiment_winners(client, store, workflows, configs, experiments)

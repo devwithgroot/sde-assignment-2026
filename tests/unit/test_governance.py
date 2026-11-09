@@ -8,23 +8,31 @@ from typing import Any
 import httpx
 
 from controller.api.client import SimulatorClient
-from controller.api.models import Workflow, WorkflowConfig
+from controller.api.models import SimState, Workflow, WorkflowConfig
 from controller.persistence.repositories import Store
 from controller.services.change_builder import (
+    ProposalDraft,
     auto_apply_permitted,
     build_winner_proposal,
     changed_dims,
     set_allocation,
 )
+from controller.services.detector import Signal
 from controller.services.experiments import ExperimentArmState, ExperimentState, persist_experiment
 from controller.services.governance import (
     apply_approved,
     next_advance_minutes,
+    persist_proposal,
     promote_experiment_winners,
+    propose_decay_rollbacks,
+    propose_experiment_exploration,
     reconcile_approvals,
+    reconcile_uncertain_auto_applies,
     run_governance_cycle,
     submit_proposal,
 )
+from controller.services.incidents import mark_incident_mitigating, open_or_refresh_incident
+from controller.services.prompt_incident import run_prompt_incident_cycle
 
 
 def _workflow(**overrides) -> Workflow:
@@ -1062,4 +1070,263 @@ def test_current_draft_resumes_without_new_id(tmp_path):
     assert out[0].proposal_id == draft.proposal_id
     assert out[0].status == "submitted"
     assert store.get_proposal(draft.proposal_id)["status"] == "submitted"
+    store.close()
+
+
+def _proposed_config() -> dict[str, Any]:
+    return {
+        "prompt_version": "P1",
+        "cohorts": [],
+        "allocations": {"default": {"welcome_message": {"W2": 1.0}, "voice": {"V1": 1.0}}},
+        "schedule": {},
+    }
+
+
+def _uncertain_proposal(source: str, source_ref: str, proposal_id: str) -> ProposalDraft:
+    return ProposalDraft(
+        proposal_id=proposal_id,
+        workflow_id="nw_renewal",
+        base_version=1,
+        status="auto_apply_uncertain",
+        source=source,
+        source_ref=source_ref,
+        changed_dims=["welcome_message"],
+        proposed_config=_proposed_config(),
+        change_summary="lost auto-apply response",
+        diff={"changed_dims": ["welcome_message"]},
+        dry_run={},
+        impact_score=0.5,
+        affected_leads=10,
+        rationale="response lost after the simulator may have applied it",
+        route="auto_apply",
+    )
+
+
+def _experiment(experiment_id: str, *, status: str, decision: str) -> ExperimentState:
+    exp = _winner_experiment()
+    exp.experiment_id = experiment_id
+    exp.status = status
+    exp.decision = decision
+    if status != "winner":
+        exp.winner_variant = None
+    exp.promotion_status = "ready_to_propose_observe_only"
+    for arm in exp.arms:
+        arm.experiment_id = experiment_id
+    return exp
+
+
+def _counting_client(live_config: dict[str, Any] | None, *, version: int = 2, status: int = 200):
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.method == "PUT":
+            return httpx.Response(500, json={"error": "should_not_retry"})
+        if status != 200:
+            return httpx.Response(status, json={"error": "config_unavailable"})
+        body = _config(version=version).model_dump()
+        if live_config is not None:
+            body["config"] = live_config
+        return httpx.Response(200, json=body)
+
+    return _mock_client(handler), calls
+
+
+def _recover(tmp_path, source: str, experiment_id: str, *, status: str, decision: str):
+    store = Store(tmp_path / "recover.sqlite")
+    exp = _experiment(experiment_id, status=status, decision=decision)
+    persist_experiment(store, exp)
+    draft = _uncertain_proposal(source, experiment_id, f"prop_{source}")
+    persist_proposal(store, draft)
+    linked = open_or_refresh_incident(
+        store,
+        Signal(
+            fingerprint=f"linked|{source}",
+            workflow_id="nw_renewal",
+            signal_type="kpi_drop",
+            kpi="engagement",
+            dimension=None,
+            cohort_id=None,
+            caller_id=None,
+            severity="medium",
+            baseline_value=0.5,
+            recent_value=0.3,
+            baseline_n=100,
+            recent_n=100,
+            threshold=0.08,
+            message="unrelated to this auto-apply",
+            evidence={},
+            sim_ts="t",
+        ),
+    )
+    mark_incident_mitigating(store, linked.incident_id, draft.proposal_id)
+    client, calls = _counting_client(_proposed_config())
+    recovered = reconcile_uncertain_auto_applies(client, store, [_workflow()])
+    return store, draft, linked, calls, recovered
+
+
+def test_winner_auto_apply_lost_response_reuses_the_same_proposal(tmp_path):
+    store, draft, linked, calls, recovered = _recover(
+        tmp_path,
+        "experiment_winner",
+        "nw_renewal|default|welcome_message",
+        status="winner",
+        decision="winner",
+    )
+    assert [item.proposal_id for item in recovered] == [draft.proposal_id]
+    saved = store.get_proposal(draft.proposal_id)
+    assert saved["status"] == "auto_applied"
+    assert saved["route"] == "auto_apply"
+    assert store.get_experiment(draft.source_ref)["promotion_status"] == "promoted_auto_apply"
+    snap = store.snapshot_for_proposal(draft.proposal_id, "post_apply")
+    assert snap is not None and int(snap["version"]) == 2
+    assert store.get_incident(linked.incident_id)["status"] == "mitigating"
+    assert not any(method == "PUT" for method, _path in calls)
+    assert any(
+        row["kind"] == "auto_apply_recovered" and row["related_proposal_id"] == draft.proposal_id
+        for row in store.list_audit("nw_renewal")
+    )
+    again, calls_again = _counting_client(_proposed_config())
+    assert reconcile_uncertain_auto_applies(again, store, [_workflow()]) == []
+    assert not any(method == "PUT" for method, _path in calls_again)
+    store.close()
+
+
+def test_explore_auto_apply_lost_response_does_not_put_again(tmp_path):
+    store, draft, _linked, calls, recovered = _recover(
+        tmp_path, "experiment_explore", "exp_explore", status="running", decision="underpowered"
+    )
+    assert [item.proposal_id for item in recovered] == [draft.proposal_id]
+    assert store.get_proposal(draft.proposal_id)["status"] == "auto_applied"
+    assert store.get_experiment("exp_explore")["promotion_status"] == "exploration_submitted"
+    assert not any(method == "PUT" for method, _path in calls)
+    assert len(store.list_proposals("nw_renewal")) == 1
+    store.close()
+
+
+def test_decay_rollback_auto_apply_lost_response_is_recovered(tmp_path):
+    store, draft, _linked, calls, recovered = _recover(
+        tmp_path, "decay_rollback", "exp_decay", status="winner", decision="winner"
+    )
+    assert [item.proposal_id for item in recovered] == [draft.proposal_id]
+    assert store.get_proposal(draft.proposal_id)["status"] == "auto_applied"
+    assert store.get_experiment("exp_decay")["promotion_status"] == "rolled_back"
+    assert not any(method == "PUT" for method, _path in calls)
+    store.close()
+
+
+def test_unproven_auto_apply_blocks_other_proposals_for_the_workflow(tmp_path):
+    store = Store(tmp_path / "block.sqlite")
+    exp = _winner_experiment()
+    persist_experiment(store, exp)
+    draft = _uncertain_proposal("experiment_winner", exp.experiment_id, "prop_uncertain")
+    draft.proposed_config = _config().config
+    persist_proposal(store, draft)
+    open_or_refresh_incident(
+        store,
+        Signal(
+            fingerprint="nw|hallucination_spike|block",
+            workflow_id="nw_renewal",
+            signal_type="hallucination_spike",
+            kpi="halluc_rate",
+            dimension="workflow",
+            cohort_id=None,
+            caller_id=None,
+            severity="high",
+            baseline_value=0.01,
+            recent_value=0.08,
+            baseline_n=200,
+            recent_n=200,
+            threshold=0.02,
+            message="hallucination flag rate rose",
+            evidence={},
+            sim_ts="t",
+        ),
+    )
+    client, calls = _counting_client(_proposed_config(), version=2)
+    recovered = reconcile_uncertain_auto_applies(client, store, [_workflow()])
+    assert recovered == []
+    assert store.get_proposal(draft.proposal_id)["status"] == "auto_apply_uncertain"
+    assert promote_experiment_winners(client, store, [_workflow()], [_config()], [exp]) == []
+    explore = _experiment("exp_explore", status="running", decision="underpowered")
+    persist_experiment(store, explore)
+    assert propose_experiment_exploration(client, store, [_workflow()], [_config()], [explore]) == []
+    assert (
+        propose_decay_rollbacks(
+            client,
+            store,
+            [_workflow()],
+            [_config()],
+            [{"workflow_id": "nw_renewal", "experiment_id": exp.experiment_id, "reason": "decayed"}],
+        )
+        == []
+    )
+    state = SimState.model_validate(
+        {
+            "scenario": "unit",
+            "sim_minute": 0,
+            "ts": "2027-01-04T00:00:00+05:30",
+            "end_minute": 100,
+            "finished": False,
+            "tick_minutes": 15,
+            "credits_remaining": 50,
+            "chunks": 1,
+            "last_event_id": 1,
+        }
+    )
+    report = run_prompt_incident_cycle(client, store, [_workflow()], [_config()], state)
+    assert any("auto_apply_uncertain" in note for note in report.notes)
+    assert not any(method in {"PUT", "POST"} for method, _path in calls)
+    assert [row["proposal_id"] for row in store.list_proposals("nw_renewal")] == [draft.proposal_id]
+    store.close()
+
+
+def test_live_config_lookup_failure_keeps_the_workflow_blocked(tmp_path):
+    store = Store(tmp_path / "lookup.sqlite")
+    exp = _winner_experiment()
+    persist_experiment(store, exp)
+    draft = _uncertain_proposal("experiment_winner", exp.experiment_id, "prop_lookup")
+    persist_proposal(store, draft)
+    client, calls = _counting_client(None, status=500)
+    recovered = reconcile_uncertain_auto_applies(client, store, [_workflow()])
+    assert recovered == []
+    assert store.get_proposal(draft.proposal_id)["status"] == "auto_apply_uncertain"
+    assert any(row["kind"] == "auto_apply_uncertain_unreconciled" for row in store.list_audit("nw_renewal"))
+    assert promote_experiment_winners(client, store, [_workflow()], [_config()], [exp]) == []
+    assert not any(method in {"PUT", "POST"} for method, _path in calls)
+    assert len(store.list_proposals("nw_renewal")) == 1
+    store.close()
+
+
+def test_http_408_auto_apply_stays_uncertain(tmp_path):
+    store = Store(tmp_path / "timeout.sqlite")
+    exp = _winner_experiment()
+    persist_experiment(store, exp)
+    built = build_winner_proposal(store, _workflow(), _config(), exp)
+    assert built is not None
+    puts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":
+            puts.append(request.url.path)
+            return httpx.Response(408, json={"error": "request_timeout", "detail": "timed out"})
+        raise AssertionError(request.method + " " + request.url.path)
+
+    wf = _workflow(
+        governance={
+            "auto_apply": {"enabled": True, "allowed_dims": ["welcome_message", "voice"], "max_shift": 1.0},
+            "approver_hours": [10, 18],
+            "approver_latency_minutes": [30, 120],
+            "proposal_ttl_hours": 24,
+            "apply_window_hours": 2,
+            "max_requests_per_24h": 5,
+            "base_reject_rate": 0.0,
+            "min_validation_pass_rate": 0.9,
+        }
+    )
+    submitted = submit_proposal(_mock_client(handler, retries=2), store, wf, _config(), built)
+    assert submitted.status == "auto_apply_uncertain"
+    assert submitted.route == "auto_apply"
+    assert puts == ["/workflows/nw_renewal/config"]
+    assert store.get_proposal(built.proposal_id)["status"] == "auto_apply_uncertain"
     store.close()
